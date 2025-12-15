@@ -123,6 +123,12 @@ docker-build: ## Build docker image with the manager.
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
 
+KIND_CLUSTER_NAME ?= rollout-dev
+
+.PHONY: kind-load
+kind-load: ## Load the manager image into the kind cluster.
+	$(KIND) load docker-image ${IMG} --name ${KIND_CLUSTER_NAME}
+
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
 # - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/
@@ -163,7 +169,12 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
+	$(KUSTOMIZE) build config/default | $(KUBECTL) apply --server-side -f -
+	git checkout -- config/manager
+
+.PHONY: dev-deploy
+dev-deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+	IMG=ghcr.io/kuberik/kuberik/openkruise-controller:$(shell git rev-parse HEAD)-$(shell date +%s) make docker-build kind-load deploy
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.

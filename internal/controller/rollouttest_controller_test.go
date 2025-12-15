@@ -1,0 +1,384 @@
+package controller
+
+import (
+	"context"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/cli-utils/pkg/kstatus/status"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	rolloutv1alpha1 "github.com/kuberik/openkruise-operator/api/v1alpha1"
+	kruiserolloutv1beta1 "github.com/openkruise/kruise-rollout-api/rollouts/v1beta1"
+)
+
+var _ = Describe("RolloutTest Controller", func() {
+	Context("When reconciling a resource", func() {
+		const resourceName = "test-resource"
+
+		var namespace string
+		var typeNamespacedName types.NamespacedName
+		var rolloutTest *rolloutv1alpha1.RolloutTest
+		var rollout *kruiserolloutv1beta1.Rollout
+
+		BeforeEach(func() {
+			ctx := context.Background()
+
+			By("creating a unique namespace for the test")
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					GenerateName: "test-ns-",
+				},
+			}
+			Expect(k8sClient.Create(ctx, ns)).To(Succeed())
+			namespace = ns.Name
+
+			typeNamespacedName = types.NamespacedName{
+				Name:      resourceName,
+				Namespace: namespace,
+			}
+
+			By("creating the Rollout")
+			rollout = &kruiserolloutv1beta1.Rollout{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-rollout",
+					Namespace: namespace,
+				},
+				Spec: kruiserolloutv1beta1.RolloutSpec{
+					Strategy: kruiserolloutv1beta1.RolloutStrategy{
+						Canary: &kruiserolloutv1beta1.CanaryStrategy{
+							Steps: []kruiserolloutv1beta1.CanaryStep{
+								{Replicas: &intstr.IntOrString{Type: intstr.Int, IntVal: 1}},
+								{Replicas: &intstr.IntOrString{Type: intstr.Int, IntVal: 2}},
+							},
+						},
+					},
+					WorkloadRef: kruiserolloutv1beta1.ObjectRef{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       "test-deployment",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, rollout)).To(Succeed())
+
+			By("creating the RolloutTest")
+			rolloutTest = &rolloutv1alpha1.RolloutTest{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resourceName,
+					Namespace: namespace,
+				},
+				Spec: rolloutv1alpha1.RolloutTestSpec{
+					RolloutName: "test-rollout",
+					StepIndex:   1,
+					JobTemplate: batchv1.JobSpec{
+						Template: corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{
+									{Name: "test", Image: "busybox", Command: []string{"echo", "hello"}},
+								},
+								RestartPolicy: corev1.RestartPolicyNever,
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, rolloutTest)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			ctx := context.Background()
+			By("Cleaning up the test namespace")
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: namespace,
+				},
+			}
+			Expect(k8sClient.Delete(ctx, ns)).To(Succeed())
+		})
+
+		It("should handle successful rollout", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutTestReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Updating Rollout to step 1")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			rollout.Status.CurrentStepIndex = 1
+			if rollout.Status.CanaryStatus == nil {
+				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+			}
+			rollout.Status.CanaryStatus.CanaryRevision = "v1"
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			By("Reconciling to create job")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying Job was created")
+			var jobs batchv1.JobList
+			err = k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": resourceName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(jobs.Items).To(HaveLen(1))
+			job := &jobs.Items[0]
+
+			By("Simulating Job success")
+			now := metav1.Now()
+			job.Status.StartTime = &now
+			job.Status.CompletionTime = &now
+			job.Status.Conditions = []batchv1.JobCondition{
+				{
+					Type:               batchv1.JobSuccessCriteriaMet,
+					Status:             corev1.ConditionTrue,
+					LastProbeTime:      now,
+					LastTransitionTime: now,
+					Reason:             "JobCompleted",
+					Message:            "Job completed successfully",
+				},
+				{
+					Type:               batchv1.JobComplete,
+					Status:             corev1.ConditionTrue,
+					LastProbeTime:      now,
+					LastTransitionTime: now,
+					Reason:             "JobCompleted",
+					Message:            "Job completed successfully",
+				},
+			}
+			job.Status.Succeeded = 1
+			Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+
+			By("Reconciling to update status")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying RolloutTest status shows success (kstatus Current)")
+			var rt rolloutv1alpha1.RolloutTest
+			err = k8sClient.Get(ctx, typeNamespacedName, &rt)
+			Expect(err).NotTo(HaveOccurred())
+
+			readyCondition := meta.FindStatusCondition(rt.Status.Conditions, "Ready")
+			Expect(readyCondition).NotTo(BeNil())
+			Expect(readyCondition.Status).To(Equal(metav1.ConditionTrue))
+			Expect(readyCondition.Reason).To(Equal("JobSucceeded"))
+
+			result, err := status.Compute(convertToUnstructured(&rt))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.Status).To(Equal(status.CurrentStatus))
+		})
+
+		It("should handle failed rollout", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutTestReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Updating Rollout to step 1")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			rollout.Status.CurrentStepIndex = 1
+			if rollout.Status.CanaryStatus == nil {
+				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+			}
+			rollout.Status.CanaryStatus.CanaryRevision = "v1"
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			By("Reconciling to create job")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying Job was created")
+			var jobs batchv1.JobList
+			err = k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": resourceName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(jobs.Items).To(HaveLen(1))
+			job := &jobs.Items[0]
+
+			By("Simulating Job failure")
+			now := metav1.Now()
+			job.Status.StartTime = &now
+			job.Status.Conditions = []batchv1.JobCondition{
+				{
+					Type:               batchv1.JobFailureTarget,
+					Status:             corev1.ConditionTrue,
+					LastProbeTime:      now,
+					LastTransitionTime: now,
+					Reason:             "BackoffLimitExceeded",
+					Message:            "Job has reached the specified backoff limit",
+				},
+				{
+					Type:               batchv1.JobFailed,
+					Status:             corev1.ConditionTrue,
+					LastProbeTime:      now,
+					LastTransitionTime: now,
+					Reason:             "BackoffLimitExceeded",
+					Message:            "Job has reached the specified backoff limit",
+				},
+			}
+			job.Status.Failed = 1
+			Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+
+			By("Reconciling to update status")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying RolloutTest status shows failure (kstatus Failed)")
+			var rt rolloutv1alpha1.RolloutTest
+			err = k8sClient.Get(ctx, typeNamespacedName, &rt)
+			Expect(err).NotTo(HaveOccurred())
+
+			failedCondition := meta.FindStatusCondition(rt.Status.Conditions, "Failed")
+			Expect(failedCondition).NotTo(BeNil())
+			Expect(failedCondition.Status).To(Equal(metav1.ConditionTrue))
+			Expect(failedCondition.Reason).To(Equal("BackoffLimitExceeded"))
+
+			stalledCondition := meta.FindStatusCondition(rt.Status.Conditions, "Stalled")
+			Expect(stalledCondition).NotTo(BeNil())
+			Expect(stalledCondition.Status).To(Equal(metav1.ConditionTrue))
+
+			result, err := status.Compute(convertToUnstructured(&rt))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.Status).To(Equal(status.FailedStatus))
+		})
+
+		It("should transition from Failed to InProgress when new rollout starts", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutTestReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			// Setup: Create a failed job for revision v1 using the controller
+			By("Setting up initial state: Rollout at v1")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			rollout.Status.CurrentStepIndex = 1
+			if rollout.Status.CanaryStatus == nil {
+				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+			}
+			rollout.Status.CanaryStatus.CanaryRevision = "v1"
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			By("Reconciling to create first job")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying first Job was created")
+			var jobs batchv1.JobList
+			err = k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": resourceName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(jobs.Items).To(HaveLen(1))
+			failedJob := &jobs.Items[0]
+
+			By("Simulating first Job failure")
+			now := metav1.Now()
+			failedJob.Status.StartTime = &now
+			failedJob.Status.Conditions = []batchv1.JobCondition{
+				{
+					Type:               batchv1.JobFailureTarget,
+					Status:             corev1.ConditionTrue,
+					LastProbeTime:      now,
+					LastTransitionTime: now,
+					Reason:             "BackoffLimitExceeded",
+					Message:            "Job has reached the specified backoff limit",
+				},
+				{
+					Type:               batchv1.JobFailed,
+					Status:             corev1.ConditionTrue,
+					LastProbeTime:      now,
+					LastTransitionTime: now,
+					Reason:             "BackoffLimitExceeded",
+					Message:            "Job has reached the specified backoff limit",
+				},
+			}
+			failedJob.Status.Failed = 1
+			Expect(k8sClient.Status().Update(ctx, failedJob)).To(Succeed())
+
+			By("Reconciling to update status to Failed")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify it is failed before proceeding
+			var rt rolloutv1alpha1.RolloutTest
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &rt)).To(Succeed())
+			failedCondition := meta.FindStatusCondition(rt.Status.Conditions, "Failed")
+			Expect(failedCondition).NotTo(BeNil())
+			Expect(failedCondition.Status).To(Equal(metav1.ConditionTrue))
+
+			By("Triggering new rollout (v2)")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			rollout.Status.CanaryStatus.CanaryRevision = "v2"
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			By("Reconciling - should delete old job")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying old job is deleted")
+			// Manually reconcile until job is deleted
+			// In envtest, deletion is async, so we might need to reconcile multiple times or wait
+			// But since we are not using Eventually, we will use a loop with Reconcile
+			for i := 0; i < 10; i++ {
+				err = k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": resourceName})
+				Expect(err).NotTo(HaveOccurred())
+				if len(jobs.Items) == 0 {
+					break
+				}
+
+				j := &jobs.Items[0]
+				if !j.DeletionTimestamp.IsZero() && len(j.Finalizers) > 0 {
+					// Manually remove finalizers to allow deletion in envtest
+					j.Finalizers = []string{}
+					_ = k8sClient.Update(ctx, j)
+				}
+
+				// Short sleep to allow envtest to process deletion
+				// This is strictly for envtest async behavior, not testing logic
+				// In real cluster, we would rely on Eventually or Watch
+				// But user requested no Eventually.
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			err = k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": resourceName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(jobs.Items).To(HaveLen(0), "Old job should be deleted")
+
+			By("Reconciling - should create new job")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying new job created")
+			err = k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": resourceName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(jobs.Items).To(HaveLen(1))
+			Expect(jobs.Items[0].Status.Failed).To(Equal(int32(0)))
+			Expect(jobs.Items[0].Status.Succeeded).To(Equal(int32(0)))
+
+			By("Reconciling to update status")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying status transitioned to InProgress")
+			err = k8sClient.Get(ctx, typeNamespacedName, &rt)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Stalled should be False
+			stalledCondition := meta.FindStatusCondition(rt.Status.Conditions, "Stalled")
+			Expect(stalledCondition).NotTo(BeNil())
+			Expect(stalledCondition.Status).To(Equal(metav1.ConditionFalse))
+
+			// kstatus should be InProgress
+			result, err := status.Compute(convertToUnstructured(&rt))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.Status).To(Equal(status.InProgressStatus))
+		})
+	})
+})

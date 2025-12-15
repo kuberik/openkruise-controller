@@ -1,0 +1,9 @@
+apiVersion: rollout.kuberik.com/v1alpha1
+kind: RolloutTest
+metadata:
+  labels:
+    app.kubernetes.io/name: openkruise-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: rollouttest-sample
+spec:
+  # TODO(user): Add fields here

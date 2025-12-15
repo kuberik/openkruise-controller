@@ -1,0 +1,9 @@
+apiVersion: vendir.k14s.io/v1alpha1
+kind: Config
+minimumRequiredVersion: 0.12.0
+directories:
+- path: config/crd/external
+  contents:
+  - path: .
+    http:
+      url: https://raw.githubusercontent.com/openkruise/rollouts/refs/tags/v0.6.2/config/crd/bases/rollouts.kruise.io_rollouts.yaml

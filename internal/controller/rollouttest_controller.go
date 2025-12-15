@@ -1,0 +1,337 @@
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	rolloutv1alpha1 "github.com/kuberik/openkruise-operator/api/v1alpha1"
+	kruiserolloutv1beta1 "github.com/openkruise/kruise-rollout-api/rollouts/v1beta1"
+)
+
+// RolloutTestReconciler reconciles a RolloutTest object
+type RolloutTestReconciler struct {
+	client.Client
+	Scheme *runtime.Scheme
+}
+
+// +kubebuilder:rbac:groups=rollout.kuberik.com,resources=rollouttests,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rollout.kuberik.com,resources=rollouttests/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=rollout.kuberik.com,resources=rollouttests/finalizers,verbs=update
+// +kubebuilder:rbac:groups=rollouts.kruise.io,resources=rollouts,verbs=get;list;watch
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+
+// Reconcile is part of the main kubernetes reconciliation loop which aims to
+// move the current state of the cluster closer to the desired state.
+func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	var rolloutTest rolloutv1alpha1.RolloutTest
+	if err := r.Get(ctx, req.NamespacedName, &rolloutTest); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// List Jobs owned by this RolloutTest
+	var jobs batchv1.JobList
+	if err := r.List(ctx, &jobs, client.InNamespace(req.Namespace), client.MatchingLabels{"rollout-test": req.Name}); err != nil {
+		log.Error(err, "unable to list child Jobs")
+		return ctrl.Result{}, err
+	}
+
+	var job *batchv1.Job
+	if len(jobs.Items) > 0 {
+		job = &jobs.Items[0]
+		// Refetch the job to get the latest status
+		var latestJob batchv1.Job
+		if err := r.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, &latestJob); err == nil {
+			job = &latestJob
+		}
+	}
+
+	// Fetch the Rollout to check current state
+	var rollout kruiserolloutv1beta1.Rollout
+	if err := r.Get(ctx, types.NamespacedName{Name: rolloutTest.Spec.RolloutName, Namespace: rolloutTest.Namespace}, &rollout); err != nil {
+		if errors.IsNotFound(err) {
+			// Rollout not found, wait
+			log.Info("Rollout not found", "rolloutName", rolloutTest.Spec.RolloutName)
+			return ctrl.Result{}, nil // Retry when Rollout is created (via Watch)
+		}
+		log.Error(err, "unable to fetch Rollout")
+		return ctrl.Result{}, err
+	}
+
+	// If Job exists, check if the canary revision has changed
+	if job != nil {
+		// Check the job's revision label
+		jobRevision := job.Labels["rollout.kuberik.io/canary-revision"]
+
+		// If the rollout's canaryRevision is different from what the job is labeled with, the rollout has changed
+		// Delete the old job so a new one can be created for the new rollout
+		if rollout.Status.CanaryStatus != nil &&
+			rollout.Status.CanaryStatus.CanaryRevision != "" &&
+			jobRevision != rollout.Status.CanaryStatus.CanaryRevision {
+
+			log.Info("Rollout canaryRevision changed, deleting old job",
+				"oldRevision", jobRevision,
+				"newRevision", rollout.Status.CanaryStatus.CanaryRevision)
+			if err := r.Delete(ctx, job); err != nil && !errors.IsNotFound(err) {
+				log.Error(err, "failed to delete old job")
+				return ctrl.Result{}, err
+			}
+			// Job deleted, will be recreated when rollout reaches target step
+			return ctrl.Result{}, nil
+		}
+
+		// If Job exists and matches revision (or we can't tell), update status based on job
+		// Get the current canaryRevision (may be empty if CanaryStatus is nil)
+		currentRevision := ""
+		if rollout.Status.CanaryStatus != nil {
+			currentRevision = rollout.Status.CanaryStatus.CanaryRevision
+		}
+		return r.updateStatus(ctx, &rolloutTest, job, currentRevision)
+	}
+
+	// If Job does not exist, check if we should create one
+	// We trigger if CurrentStepIndex matches StepIndex
+	if rollout.Status.CurrentStepIndex == rolloutTest.Spec.StepIndex {
+		log.Info("Rollout is at target step, creating Job", "step", rolloutTest.Spec.StepIndex)
+		// Get the current canaryRevision (may be empty if CanaryStatus is nil)
+		currentRevision := ""
+		if rollout.Status.CanaryStatus != nil {
+			currentRevision = rollout.Status.CanaryStatus.CanaryRevision
+		}
+		return r.createJob(ctx, &rolloutTest, currentRevision)
+	}
+
+	// Not at the step yet, or passed it?
+	// If passed, we missed it? Or maybe we should run it anyway?
+	// For now, do nothing.
+	return ctrl.Result{}, nil
+}
+
+func (r *RolloutTestReconciler) createJob(ctx context.Context, rolloutTest *rolloutv1alpha1.RolloutTest, canaryRevision string) (ctrl.Result, error) {
+	labels := map[string]string{
+		"rollout-test": rolloutTest.Name,
+	}
+	if canaryRevision != "" {
+		labels["rollout.kuberik.io/canary-revision"] = canaryRevision
+	}
+
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: rolloutTest.Name + "-",
+			Namespace:    rolloutTest.Namespace,
+			Labels:       labels,
+		},
+		Spec: rolloutTest.Spec.JobTemplate,
+	}
+
+	if err := ctrl.SetControllerReference(rolloutTest, job, r.Scheme); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.Create(ctx, job); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Update the RolloutTest status to record which canaryRevision this job is for
+	rolloutTest.Status.ObservedCanaryRevision = canaryRevision
+	if err := r.Status().Update(ctx, rolloutTest); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// isJobFailed checks if a Job has failed by examining its conditions
+func (r *RolloutTestReconciler) isJobFailed(job *batchv1.Job) bool {
+	for _, condition := range job.Status.Conditions {
+		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+		if condition.Type == batchv1.JobFailureTarget && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+// isJobSucceeded checks if a Job has succeeded by examining its conditions
+func (r *RolloutTestReconciler) isJobSucceeded(job *batchv1.Job) bool {
+	for _, condition := range job.Status.Conditions {
+		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *RolloutTestReconciler) updateStatus(ctx context.Context, rolloutTest *rolloutv1alpha1.RolloutTest, job *batchv1.Job, canaryRevision string) (ctrl.Result, error) {
+	// Check for failure first (higher priority than success)
+	if r.isJobFailed(job) {
+		// Extract failure message from job conditions if available
+		failureMessage := "Test job failed"
+		failureReason := "JobFailed"
+		for _, condition := range job.Status.Conditions {
+			if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
+				if condition.Message != "" {
+					failureMessage = condition.Message
+				}
+				if condition.Reason != "" {
+					failureReason = condition.Reason
+				}
+				break
+			}
+		}
+
+		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: rolloutTest.Generation,
+			Reason:             failureReason,
+			Message:            failureMessage,
+			LastTransitionTime: metav1.Now(),
+		})
+		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+			Type:               "Failed",
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: rolloutTest.Generation,
+			Reason:             failureReason,
+			Message:            failureMessage,
+			LastTransitionTime: metav1.Now(),
+		})
+		// Set Stalled condition to True for kstatus compatibility (maps to FailedStatus)
+		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+			Type:               "Stalled",
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: rolloutTest.Generation,
+			Reason:             failureReason,
+			Message:            failureMessage,
+			LastTransitionTime: metav1.Now(),
+		})
+	} else if r.isJobSucceeded(job) {
+		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: rolloutTest.Generation,
+			Reason:             "JobSucceeded",
+			Message:            "Test job completed successfully",
+			LastTransitionTime: metav1.Now(),
+		})
+		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+			Type:               "Failed",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: rolloutTest.Generation,
+			Reason:             "JobSucceeded",
+			Message:            "Test job completed successfully",
+			LastTransitionTime: metav1.Now(),
+		})
+		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+			Type:               "Stalled",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: rolloutTest.Generation,
+			Reason:             "JobSucceeded",
+			Message:            "Test job completed successfully",
+			LastTransitionTime: metav1.Now(),
+		})
+	} else {
+		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: rolloutTest.Generation,
+			Reason:             "JobInProgress",
+			Message:            "Test job is running",
+			LastTransitionTime: metav1.Now(),
+		})
+		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+			Type:               "Failed",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: rolloutTest.Generation,
+			Reason:             "JobInProgress",
+			Message:            "Test job is running",
+			LastTransitionTime: metav1.Now(),
+		})
+		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+			Type:               "Stalled",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: rolloutTest.Generation,
+			Reason:             "JobInProgress",
+			Message:            "Test job is running",
+			LastTransitionTime: metav1.Now(),
+		})
+	}
+
+	// Ensure ObservedCanaryRevision matches the Job's revision.
+	// This handles cases where createJob created the job but failed to update the status.
+	if revision, ok := job.Labels["rollout.kuberik.io/canary-revision"]; ok {
+		rolloutTest.Status.ObservedCanaryRevision = revision
+	}
+
+	if err := r.Status().Update(ctx, rolloutTest); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *RolloutTestReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&rolloutv1alpha1.RolloutTest{}).
+		Named("rollouttest").
+		Owns(&batchv1.Job{}).
+		Watches(
+			&kruiserolloutv1beta1.Rollout{},
+			handler.EnqueueRequestsFromMapFunc(r.findRolloutTestsForRollout),
+		).
+		Complete(r)
+}
+
+func (r *RolloutTestReconciler) findRolloutTestsForRollout(ctx context.Context, o client.Object) []reconcile.Request {
+	rollout := o.(*kruiserolloutv1beta1.Rollout)
+
+	var rolloutTests rolloutv1alpha1.RolloutTestList
+	if err := r.List(ctx, &rolloutTests, client.InNamespace(rollout.Namespace)); err != nil {
+		return []reconcile.Request{}
+	}
+
+	var requests []reconcile.Request
+	for _, rt := range rolloutTests.Items {
+		if rt.Spec.RolloutName == rollout.Name {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      rt.Name,
+					Namespace: rt.Namespace,
+				},
+			})
+		}
+	}
+	return requests
+}
