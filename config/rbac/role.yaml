@@ -49,4 +49,12 @@ rules:
   verbs:
   - get
   - list
+  - patch
+  - update
   - watch
+- apiGroups:
+  - rollouts.kruise.io
+  resources:
+  - rollouts/status
+  verbs:
+  - get
