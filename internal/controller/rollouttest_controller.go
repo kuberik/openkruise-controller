@@ -119,9 +119,14 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// If Job does not exist, check if we should create one
-	// We trigger if CurrentStepIndex matches StepIndex
+	// We trigger if CurrentStepIndex matches StepIndex AND canary is paused
 	if rollout.Status.CurrentStepIndex == rolloutTest.Spec.StepIndex {
-		log.Info("Rollout is at target step, creating Job", "step", rolloutTest.Spec.StepIndex)
+		// Check if canary is in paused state before creating the job
+		if !r.isCanaryPaused(&rollout) {
+			log.Info("Rollout is at target step but canary is not paused, waiting", "step", rolloutTest.Spec.StepIndex)
+			return ctrl.Result{}, nil
+		}
+		log.Info("Rollout is at target step and canary is paused, creating Job", "step", rolloutTest.Spec.StepIndex)
 		// Get the current canaryRevision (may be empty if CanaryStatus is nil)
 		currentRevision := ""
 		if rollout.Status.CanaryStatus != nil {
@@ -299,6 +304,17 @@ func (r *RolloutTestReconciler) updateStatus(ctx context.Context, rolloutTest *r
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// isCanaryPaused checks if the canary is in a paused state
+func (r *RolloutTestReconciler) isCanaryPaused(rollout *kruiserolloutv1beta1.Rollout) bool {
+	if rollout.Status.CanaryStatus == nil {
+		return false
+	}
+	// Check if currentStepState indicates paused state
+	// Common values: "StepPaused", "Paused", etc.
+	state := rollout.Status.CanaryStatus.CurrentStepState
+	return state == "StepPaused" || state == "Paused"
 }
 
 // SetupWithManager sets up the controller with the Manager.
