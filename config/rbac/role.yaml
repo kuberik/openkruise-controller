@@ -58,3 +58,5 @@ rules:
   - rollouts/status
   verbs:
   - get
+  - patch
+  - update

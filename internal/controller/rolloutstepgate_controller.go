@@ -22,6 +22,7 @@ import (
 	"math"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -43,6 +44,10 @@ const (
 	// Internal annotation keys (controller-managed)
 	// Store when the step became ready for approval (step paused AND all tests passed)
 	internalAnnotationStepReadyAtPrefix = "internal.rollout.kuberik.io/step-%d-ready-at"
+	// Store the last canary revision we processed for this step
+	internalAnnotationStepLastRevisionPrefix = "internal.rollout.kuberik.io/step-%d-last-revision"
+	// Store the last step index we processed (to detect step changes)
+	internalAnnotationLastStepIndex = "internal.rollout.kuberik.io/last-step-index"
 
 	// Large duration to effectively pause indefinitely (max int32, ~68 years in seconds)
 	maxPauseDuration = int32(math.MaxInt32)
@@ -55,7 +60,7 @@ type RolloutStepGateReconciler struct {
 }
 
 // +kubebuilder:rbac:groups=rollouts.kruise.io,resources=rollouts,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=rollouts.kruise.io,resources=rollouts/status,verbs=get
+// +kubebuilder:rbac:groups=rollouts.kruise.io,resources=rollouts/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=rollout.kuberik.com,resources=rollouttests,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop
@@ -75,6 +80,95 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	currentStepIndex := rollout.Status.CanaryStatus.CurrentStepIndex
 	if currentStepIndex <= 0 {
 		return ctrl.Result{}, nil
+	}
+
+	// Check if this is a new rollout version - if so, clear Stalled condition
+	// Do this early before any Updates that might affect annotations
+	currentRevision := rollout.Status.CanaryStatus.CanaryRevision
+
+	// Check if Stalled condition exists for a different canary revision
+	if err := r.clearStalledConditionIfNewCanary(ctx, &rollout, currentRevision); err != nil {
+		log.Error(err, "failed to check/clear Stalled condition for new canary")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+	}
+
+	lastRevisionStr := r.getStepAnnotation(&rollout, currentStepIndex, internalAnnotationStepLastRevisionPrefix)
+	if lastRevisionStr != "" && lastRevisionStr != currentRevision {
+		// New rollout version detected, clear Stalled condition
+		log.Info("New rollout version detected, clearing Stalled condition",
+			"step", currentStepIndex,
+			"oldRevision", lastRevisionStr,
+			"newRevision", currentRevision)
+		if err := r.clearStalledCondition(ctx, &rollout); err != nil {
+			log.Error(err, "failed to clear Stalled condition for new revision")
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+		}
+		// Update the last revision annotation
+		if err := r.setStepAnnotation(ctx, &rollout, currentStepIndex, internalAnnotationStepLastRevisionPrefix, currentRevision); err != nil {
+			log.Error(err, "failed to update last revision annotation")
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+		}
+		// Also clear the ready-at annotation since this is a new rollout
+		if err := r.cleanupStepAnnotations(ctx, &rollout, currentStepIndex); err != nil {
+			log.Error(err, "failed to cleanup step annotations for new revision")
+			// Non-fatal, continue
+		}
+		// Refetch rollout after updates
+		if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
+			return ctrl.Result{}, err
+		}
+	} else if lastRevisionStr == "" && currentRevision != "" {
+		// First time processing this revision, record it
+		if err := r.setStepAnnotation(ctx, &rollout, currentStepIndex, internalAnnotationStepLastRevisionPrefix, currentRevision); err != nil {
+			log.Error(err, "failed to set last revision annotation")
+			// Non-fatal, continue
+		}
+		// Refetch after update
+		if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Check if step has changed - if so, clear Stalled condition
+	if rollout.Annotations != nil {
+		lastStepIndexStr := rollout.Annotations[internalAnnotationLastStepIndex]
+		if lastStepIndexStr != "" {
+			var lastStepIndex int32
+			if _, err := fmt.Sscanf(lastStepIndexStr, "%d", &lastStepIndex); err == nil {
+				if lastStepIndex != currentStepIndex {
+					// Step changed, clear Stalled condition
+					log.Info("Step changed, clearing Stalled condition",
+						"oldStep", lastStepIndex,
+						"newStep", currentStepIndex)
+					if err := r.clearStalledCondition(ctx, &rollout); err != nil {
+						log.Error(err, "failed to clear Stalled condition for step change")
+						return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+					}
+					// Refetch rollout after status update
+					if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
+						return ctrl.Result{}, err
+					}
+				}
+			}
+		}
+	}
+
+	// Update last step index annotation (only if changed)
+	if rollout.Annotations == nil {
+		rollout.Annotations = make(map[string]string)
+	}
+	lastStepIndexStr := rollout.Annotations[internalAnnotationLastStepIndex]
+	if lastStepIndexStr != fmt.Sprintf("%d", currentStepIndex) {
+		rollout.Annotations[internalAnnotationLastStepIndex] = fmt.Sprintf("%d", currentStepIndex)
+		if err := r.Update(ctx, &rollout); err != nil {
+			log.Error(err, "failed to update last step index annotation")
+			// Non-fatal, continue
+		} else {
+			// Refetch rollout after update
+			if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 	}
 
 	// Check if this step has auto-approval configuration
@@ -106,6 +200,11 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
+	// Refetch rollout after ensureStepPaused (which may have updated the rollout)
+	if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// Check if step is actually paused (in StepPaused state)
 	isStepPaused := r.isStepPaused(&rollout, currentStepIndex)
 
@@ -116,7 +215,6 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	// Filter tests that match the current canary revision
-	currentRevision := rollout.Status.CanaryStatus.CanaryRevision
 	var relevantTests []rolloutv1alpha1.RolloutTest
 	for _, test := range tests {
 		if test.Status.ObservedCanaryRevision == currentRevision || currentRevision == "" {
@@ -181,9 +279,24 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	// Check for timeout
 	if now.After(deadline) {
-		log.Info("Step max-wait exceeded, keeping paused", "step", currentStepIndex, "deadline", deadline)
+		log.Info("Step max-wait exceeded, keeping paused", "step", currentStepIndex, "deadline", deadline, "now", now)
+		// Refetch rollout to ensure we have latest resource version before status update
+		if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
+			return ctrl.Result{}, err
+		}
+		// Set Stalled condition for kstatus compatibility (maps to FailedStatus)
+		if err := r.setStalledCondition(ctx, &rollout, currentStepIndex, deadline, maxWait); err != nil {
+			log.Error(err, "failed to set Stalled condition")
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+		}
 		// Keep paused - user needs to intervene
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	// Clear Stalled condition if it exists (we're within deadline)
+	if err := r.clearStalledCondition(ctx, &rollout); err != nil {
+		log.Error(err, "failed to clear Stalled condition")
+		// Non-fatal, continue
 	}
 
 	// Check if min-wait-after-success has elapsed since step became ready
@@ -380,6 +493,153 @@ func (r *RolloutStepGateReconciler) evaluateTests(tests []rolloutv1alpha1.Rollou
 
 	// Otherwise, still waiting
 	return false, false
+}
+
+// setStalledCondition sets the Stalled condition on the Rollout when max wait is exceeded
+func (r *RolloutStepGateReconciler) setStalledCondition(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout, stepIndex int32, deadline time.Time, maxWait time.Duration) error {
+	// Check if condition already exists and is up to date
+	if rollout.Status.Conditions != nil {
+		for _, condition := range rollout.Status.Conditions {
+			if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") && condition.Status == corev1.ConditionTrue {
+				// Condition already set, no need to update
+				return nil
+			}
+		}
+	}
+
+	// Initialize conditions slice if nil
+	if rollout.Status.Conditions == nil {
+		rollout.Status.Conditions = []kruiserolloutv1beta1.RolloutCondition{}
+	}
+
+	currentRevision := rollout.Status.CanaryStatus.CanaryRevision
+	message := fmt.Sprintf("Step %d max-wait (%v) exceeded at %v for canary %s. Rollout is paused and requires manual intervention.", stepIndex, maxWait, deadline.Format(time.RFC3339), currentRevision)
+	now := metav1.Now()
+
+	// Find and update existing condition or add new one
+	found := false
+	for i := range rollout.Status.Conditions {
+		if rollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
+			rollout.Status.Conditions[i].Status = corev1.ConditionTrue
+			rollout.Status.Conditions[i].Reason = "MaxWaitExceeded"
+			rollout.Status.Conditions[i].Message = message
+			rollout.Status.Conditions[i].LastTransitionTime = now
+			rollout.Status.Conditions[i].LastUpdateTime = now
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		rollout.Status.Conditions = append(rollout.Status.Conditions, kruiserolloutv1beta1.RolloutCondition{
+			Type:               kruiserolloutv1beta1.RolloutConditionType("Stalled"),
+			Status:             corev1.ConditionTrue,
+			Reason:             "MaxWaitExceeded",
+			Message:            message,
+			LastTransitionTime: now,
+			LastUpdateTime:     now,
+		})
+	}
+
+	return r.Status().Update(ctx, rollout)
+}
+
+// clearStalledConditionIfNewCanary checks if the Stalled condition is for a different canary revision
+// and clears it if so. The canary revision is embedded in the condition message.
+func (r *RolloutStepGateReconciler) clearStalledConditionIfNewCanary(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout, currentRevision string) error {
+	if rollout.Status.Conditions == nil || currentRevision == "" {
+		return nil
+	}
+
+	// Find Stalled condition and check if it's for a different canary
+	for _, condition := range rollout.Status.Conditions {
+		if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") && condition.Status == corev1.ConditionTrue {
+			// Extract canary revision from message
+			// Message format: "Step X max-wait (...) exceeded at ... for canary REVISION. ..."
+			stalledRevision := r.extractCanaryRevisionFromMessage(condition.Message)
+			if stalledRevision != "" && stalledRevision != currentRevision {
+				// Stalled condition is for a different canary, clear it
+				log := logf.FromContext(ctx)
+				log.Info("Stalled condition is for different canary, clearing it",
+					"stalledCanary", stalledRevision,
+					"currentCanary", currentRevision)
+				return r.clearStalledCondition(ctx, rollout)
+			}
+			break
+		}
+	}
+
+	return nil
+}
+
+// extractCanaryRevisionFromMessage extracts the canary revision from the Stalled condition message
+// Message format: "Step X max-wait (...) exceeded at ... for canary REVISION. ..."
+func (r *RolloutStepGateReconciler) extractCanaryRevisionFromMessage(message string) string {
+	// Look for "for canary " followed by the revision
+	prefix := "for canary "
+	prefixIdx := -1
+	for i := 0; i <= len(message)-len(prefix); i++ {
+		if message[i:i+len(prefix)] == prefix {
+			prefixIdx = i + len(prefix)
+			break
+		}
+	}
+	if prefixIdx == -1 || prefixIdx >= len(message) {
+		return ""
+	}
+
+	// Extract revision until we hit a period or space
+	end := prefixIdx
+	for end < len(message) && message[end] != '.' && message[end] != ' ' {
+		end++
+	}
+
+	if end > prefixIdx {
+		return message[prefixIdx:end]
+	}
+	return ""
+}
+
+// clearStalledCondition clears the Stalled condition on the Rollout
+func (r *RolloutStepGateReconciler) clearStalledCondition(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) error {
+	if rollout.Status.Conditions == nil {
+		return nil
+	}
+
+	// Check if Stalled condition exists and is True
+	stalledExists := false
+	for _, condition := range rollout.Status.Conditions {
+		if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") && condition.Status == corev1.ConditionTrue {
+			stalledExists = true
+			break
+		}
+	}
+
+	if !stalledExists {
+		return nil
+	}
+
+	// Refetch rollout to ensure we have latest resource version before status update
+	// This is important to avoid conflicts
+	namespacedName := types.NamespacedName{Name: rollout.Name, Namespace: rollout.Namespace}
+	if err := r.Get(ctx, namespacedName, rollout); err != nil {
+		return err
+	}
+
+	// Update the condition to False
+	now := metav1.Now()
+	for i := range rollout.Status.Conditions {
+		if rollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
+			rollout.Status.Conditions[i].Status = corev1.ConditionFalse
+			rollout.Status.Conditions[i].Reason = "WithinDeadline"
+			rollout.Status.Conditions[i].Message = "Step is within max-wait deadline"
+			rollout.Status.Conditions[i].LastTransitionTime = now
+			rollout.Status.Conditions[i].LastUpdateTime = now
+			break
+		}
+	}
+
+	return r.Status().Update(ctx, rollout)
 }
 
 // SetupWithManager sets up the controller with the Manager.
