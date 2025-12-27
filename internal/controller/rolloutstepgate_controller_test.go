@@ -107,14 +107,14 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			Expect(k8sClient.Delete(ctx, ns)).To(Succeed())
 		})
 
-		It("should set Stalled condition when max wait is exceeded", func() {
+		It("should set Stalled condition when max wait is exceeded before step becomes ready", func() {
 			ctx := context.Background()
 			controllerReconciler := &RolloutStepGateReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
 			}
 
-			By("Setting up Rollout at step 1, paused, with tests passed")
+			By("Setting up Rollout at step 1, paused, but tests NOT passed yet")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
 			if rollout.Status.CanaryStatus == nil {
 				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
@@ -124,27 +124,19 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
-			By("Setting up RolloutTest as passed")
+			By("Setting up RolloutTest as NOT passed (still running)")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollouttest", Namespace: namespace}, rolloutTest)).To(Succeed())
 			rolloutTest.Status.ObservedCanaryRevision = "v1"
-			now := metav1.Now()
-			rolloutTest.Status.Conditions = []metav1.Condition{
-				{
-					Type:               "Ready",
-					Status:             metav1.ConditionTrue,
-					Reason:             "JobSucceeded",
-					LastTransitionTime: now,
-				},
-			}
-			Expect(k8sClient.Status().Update(ctx, rolloutTest)).To(Succeed())
+			// No conditions set, so test is not passed yet
 
-			By("Setting ready-at annotation to a time in the past (exceeding max-wait)")
+			By("Setting started-at annotation to a time in the past (exceeding max-wait)")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
 			pastTime := time.Now().Add(-2 * time.Minute) // 2 minutes ago, max-wait is 1 minute
 			if rollout.Annotations == nil {
 				rollout.Annotations = make(map[string]string)
 			}
-			rollout.Annotations["internal.rollout.kuberik.io/step-1-ready-at"] = pastTime.Format(time.RFC3339)
+			rollout.Annotations["internal.rollout.kuberik.io/step-1-started-at"] = pastTime.Format(time.RFC3339)
+			rollout.Annotations["internal.rollout.kuberik.io/last-step-index"] = "1"
 			Expect(k8sClient.Update(ctx, rollout)).To(Succeed())
 
 			By("Reconciling - should detect timeout and set Stalled condition")
@@ -181,6 +173,187 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			result, err := status.Compute(unstructuredRollout)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result.Status).To(Equal(status.FailedStatus))
+		})
+
+		It("should NOT timeout if step becomes ready before deadline", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Setting up Rollout at step 1, paused, with tests passed")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Status.CanaryStatus == nil {
+				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+			}
+			rollout.Status.CanaryStatus.CurrentStepIndex = 1
+			rollout.Status.CanaryStatus.CanaryRevision = "v1"
+			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			By("Setting up RolloutTest as passed")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollouttest", Namespace: namespace}, rolloutTest)).To(Succeed())
+			rolloutTest.Status.ObservedCanaryRevision = "v1"
+			now := metav1.Now()
+			rolloutTest.Status.Conditions = []metav1.Condition{
+				{
+					Type:               "Ready",
+					Status:             metav1.ConditionTrue,
+					Reason:             "JobSucceeded",
+					LastTransitionTime: now,
+				},
+			}
+			Expect(k8sClient.Status().Update(ctx, rolloutTest)).To(Succeed())
+
+			By("Setting started-at to a time in the past, and step became ready (so no timeout)")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			// Started 2 minutes ago (deadline would have been 1 minute ago, so deadline passed)
+			startedAtTime := time.Now().Add(-2 * time.Minute)
+			// But step became ready 30 seconds ago - once ready, we don't check timeout anymore
+			readyAtTime := time.Now().Add(-30 * time.Second)
+			if rollout.Annotations == nil {
+				rollout.Annotations = make(map[string]string)
+			}
+			rollout.Annotations["internal.rollout.kuberik.io/step-1-started-at"] = startedAtTime.Format(time.RFC3339)
+			rollout.Annotations["internal.rollout.kuberik.io/step-1-ready-at"] = readyAtTime.Format(time.RFC3339)
+			rollout.Annotations["internal.rollout.kuberik.io/last-step-index"] = "1"
+			Expect(k8sClient.Update(ctx, rollout)).To(Succeed())
+
+			By("Reconciling - should NOT set Stalled condition since step became ready")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying Stalled condition is NOT set")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+
+			var stalledCondition *kruiserolloutv1beta1.RolloutCondition
+			if rollout.Status.Conditions != nil {
+				for i := range rollout.Status.Conditions {
+					if rollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
+						stalledCondition = &rollout.Status.Conditions[i]
+						break
+					}
+				}
+			}
+			// Stalled condition should either not exist, or if it exists, it should be False
+			if stalledCondition != nil {
+				Expect(stalledCondition.Status).To(Equal(corev1.ConditionFalse), "Stalled condition should be False when step is ready")
+			}
+		})
+
+		It("should NOT set readyAt when RolloutTest job is still running", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Setting up Rollout at step 1, paused")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Status.CanaryStatus == nil {
+				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+			}
+			rollout.Status.CanaryStatus.CurrentStepIndex = 1
+			rollout.Status.CanaryStatus.CanaryRevision = "v1"
+			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			By("Setting up RolloutTest with job still running (Ready condition is False)")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollouttest", Namespace: namespace}, rolloutTest)).To(Succeed())
+			rolloutTest.Status.ObservedCanaryRevision = "v1"
+			now := metav1.Now()
+			// Job is running - Ready condition is False
+			rolloutTest.Status.Conditions = []metav1.Condition{
+				{
+					Type:               "Ready",
+					Status:             metav1.ConditionFalse,
+					Reason:             "JobInProgress",
+					Message:            "Test job is running",
+					LastTransitionTime: now,
+				},
+			}
+			Expect(k8sClient.Status().Update(ctx, rolloutTest)).To(Succeed())
+
+			By("Setting started-at annotation")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Annotations == nil {
+				rollout.Annotations = make(map[string]string)
+			}
+			rollout.Annotations["internal.rollout.kuberik.io/step-1-started-at"] = time.Now().Add(-10 * time.Second).Format(time.RFC3339)
+			rollout.Annotations["internal.rollout.kuberik.io/last-step-index"] = "1"
+			Expect(k8sClient.Update(ctx, rollout)).To(Succeed())
+
+			By("Reconciling - should NOT set readyAt since test is still running")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying readyAt annotation is NOT set")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			readyAtKey := "internal.rollout.kuberik.io/step-1-ready-at"
+			readyAtValue, exists := rollout.Annotations[readyAtKey]
+			Expect(exists).To(BeFalse(), "readyAt annotation should not be set when test is still running")
+			Expect(readyAtValue).To(BeEmpty())
+		})
+
+		It("should NOT set readyAt when RolloutTest has no conditions (not yet processed)", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Setting up Rollout at step 1, paused")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Status.CanaryStatus == nil {
+				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+			}
+			rollout.Status.CanaryStatus.CurrentStepIndex = 1
+			rollout.Status.CanaryStatus.CanaryRevision = "v1"
+			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			By("Setting up RolloutTest with no conditions (not yet processed by RolloutTest controller)")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollouttest", Namespace: namespace}, rolloutTest)).To(Succeed())
+			rolloutTest.Status.ObservedCanaryRevision = "v1"
+			// No conditions set - test hasn't been processed yet
+			rolloutTest.Status.Conditions = []metav1.Condition{}
+			Expect(k8sClient.Status().Update(ctx, rolloutTest)).To(Succeed())
+
+			By("Setting started-at annotation")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Annotations == nil {
+				rollout.Annotations = make(map[string]string)
+			}
+			rollout.Annotations["internal.rollout.kuberik.io/step-1-started-at"] = time.Now().Add(-10 * time.Second).Format(time.RFC3339)
+			rollout.Annotations["internal.rollout.kuberik.io/last-step-index"] = "1"
+			Expect(k8sClient.Update(ctx, rollout)).To(Succeed())
+
+			By("Reconciling - should NOT set readyAt since test has no conditions")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying readyAt annotation is NOT set")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			readyAtKey := "internal.rollout.kuberik.io/step-1-ready-at"
+			readyAtValue, exists := rollout.Annotations[readyAtKey]
+			Expect(exists).To(BeFalse(), "readyAt annotation should not be set when test has no conditions")
+			Expect(readyAtValue).To(BeEmpty())
 		})
 
 		It("should clear Stalled condition when within deadline", func() {
@@ -225,14 +398,16 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 			Expect(k8sClient.Status().Update(ctx, rolloutTest)).To(Succeed())
 
-			By("Setting ready-at annotation to a recent time (within max-wait)")
+			By("Setting started-at annotation to a recent time (within max-wait) and step is ready")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
-			// Set ready-at to 10 seconds ago, so deadline is 50 seconds from now (well within max-wait of 1 minute)
+			// Set started-at to 10 seconds ago, so deadline is 50 seconds from now (well within max-wait of 1 minute)
 			recentTime := time.Now().Add(-10 * time.Second)
 			if rollout.Annotations == nil {
 				rollout.Annotations = make(map[string]string)
 			}
-			rollout.Annotations["internal.rollout.kuberik.io/step-1-ready-at"] = recentTime.Format(time.RFC3339)
+			rollout.Annotations["internal.rollout.kuberik.io/step-1-started-at"] = recentTime.Format(time.RFC3339)
+			rollout.Annotations["internal.rollout.kuberik.io/step-1-ready-at"] = recentTime.Format(time.RFC3339) // Step is ready
+			rollout.Annotations["internal.rollout.kuberik.io/last-step-index"] = "1"
 			Expect(k8sClient.Update(ctx, rollout)).To(Succeed())
 
 			By("Reconciling - should clear Stalled condition")

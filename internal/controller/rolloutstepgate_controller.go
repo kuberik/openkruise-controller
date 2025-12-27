@@ -46,6 +46,8 @@ const (
 	annotationStepMinWaitAfterSuccessPrefix = "rollout.kuberik.io/step-%d-min-wait-after-success"
 
 	// Internal annotation keys (controller-managed)
+	// Store when the step started (when we first entered this step)
+	internalAnnotationStepStartedAtPrefix = "internal.rollout.kuberik.io/step-%d-started-at"
 	// Store when the step became ready for approval (step paused AND all tests passed)
 	internalAnnotationStepReadyAtPrefix = "internal.rollout.kuberik.io/step-%d-ready-at"
 	// Store the last canary revision we processed for this step
@@ -171,15 +173,22 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
-	// Update last step index annotation (only if changed)
+	// Update last step index annotation and record step start time (only if changed)
 	if rollout.Annotations == nil {
 		rollout.Annotations = make(map[string]string)
 	}
 	lastStepIndexStr := rollout.Annotations[internalAnnotationLastStepIndex]
 	if lastStepIndexStr != fmt.Sprintf("%d", currentStepIndex) {
+		// Step changed, record when this step started
+		now := time.Now()
 		rollout.Annotations[internalAnnotationLastStepIndex] = fmt.Sprintf("%d", currentStepIndex)
+		startedAtKey := fmt.Sprintf(internalAnnotationStepStartedAtPrefix, currentStepIndex)
+		rollout.Annotations[startedAtKey] = now.Format(time.RFC3339)
+		// Also clear ready-at annotation since this is a new step
+		readyAtKey := fmt.Sprintf(internalAnnotationStepReadyAtPrefix, currentStepIndex)
+		delete(rollout.Annotations, readyAtKey)
 		if err := r.Update(ctx, &rollout); err != nil {
-			log.Error(err, "failed to update last step index annotation")
+			log.Error(err, "failed to update step index and start time annotations")
 			// Non-fatal, continue
 		} else {
 			// Refetch rollout after update
@@ -252,6 +261,33 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
+	// Get when the step started
+	startedAtStr := r.getStepAnnotation(&rollout, currentStepIndex, internalAnnotationStepStartedAtPrefix)
+	var startedAt time.Time
+	if startedAtStr == "" {
+		// Step start time not recorded yet, record it now
+		startedAt = now
+		if err := r.setStepAnnotation(ctx, &rollout, currentStepIndex, internalAnnotationStepStartedAtPrefix, startedAt.Format(time.RFC3339)); err != nil {
+			return ctrl.Result{}, err
+		}
+		log.Info("Step start time recorded", "step", currentStepIndex, "startedAt", startedAt)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	} else {
+		var err error
+		startedAt, err = time.Parse(time.RFC3339, startedAtStr)
+		if err != nil {
+			log.Error(err, "invalid started-at timestamp, resetting", "step", currentStepIndex)
+			startedAt = now
+			if err := r.setStepAnnotation(ctx, &rollout, currentStepIndex, internalAnnotationStepStartedAtPrefix, startedAt.Format(time.RFC3339)); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+	}
+
+	// Calculate deadline from when step started
+	deadline := startedAt.Add(maxWait)
+
 	// Determine when the step became ready for approval
 	// Ready = step paused AND all tests passed (whichever happens later)
 	readyAtStr := r.getStepAnnotation(&rollout, currentStepIndex, internalAnnotationStepReadyAtPrefix)
@@ -266,7 +302,6 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				return ctrl.Result{}, err
 			}
 			log.Info("Step ready for approval", "step", currentStepIndex, "readyAt", readyAt)
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		} else {
 			// We've been ready before, use stored timestamp
 			var err error
@@ -282,36 +317,54 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	} else {
 		// Not ready yet - either step not paused or tests not all passed
-		// Don't start the approval timer yet
+		// Clear readyAt annotation if it exists, since step is no longer ready
+		if readyAtStr != "" {
+			log.Info("Step no longer ready, clearing readyAt annotation", "step", currentStepIndex)
+			if err := r.cleanupStepAnnotations(ctx, &rollout, currentStepIndex); err != nil {
+				log.Error(err, "failed to clear readyAt annotation")
+				// Non-fatal, continue
+			} else {
+				// Refetch rollout after cleanup
+				if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
+		}
+
 		if !isStepPaused {
 			log.Info("Waiting for step to pause", "step", currentStepIndex)
 		} else if !allPassed {
 			log.Info("Waiting for all tests to pass", "step", currentStepIndex)
 		}
+
+		// Check for timeout only if step is NOT ready yet
+		if now.After(deadline) {
+			log.Info("Step max-wait exceeded before becoming ready, keeping paused", "step", currentStepIndex, "deadline", deadline, "now", now)
+			// Refetch rollout to ensure we have latest resource version before status update
+			if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
+				return ctrl.Result{}, err
+			}
+			// Set Stalled condition for kstatus compatibility (maps to FailedStatus)
+			if err := r.setStalledCondition(ctx, &rollout, currentStepIndex, deadline, maxWait); err != nil {
+				log.Error(err, "failed to set Stalled condition")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+			}
+			// Keep paused - user needs to intervene
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+
+		// Clear Stalled condition if it exists (we're within deadline)
+		if err := r.clearStalledCondition(ctx, &rollout); err != nil {
+			log.Error(err, "failed to clear Stalled condition")
+			// Non-fatal, continue
+		}
+
 		// Requeue to check again
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// Calculate deadline from when step became ready
-	deadline := readyAt.Add(maxWait)
-
-	// Check for timeout
-	if now.After(deadline) {
-		log.Info("Step max-wait exceeded, keeping paused", "step", currentStepIndex, "deadline", deadline, "now", now)
-		// Refetch rollout to ensure we have latest resource version before status update
-		if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
-			return ctrl.Result{}, err
-		}
-		// Set Stalled condition for kstatus compatibility (maps to FailedStatus)
-		if err := r.setStalledCondition(ctx, &rollout, currentStepIndex, deadline, maxWait); err != nil {
-			log.Error(err, "failed to set Stalled condition")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-		}
-		// Keep paused - user needs to intervene
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
-
-	// Clear Stalled condition if it exists (we're within deadline)
+	// Step is ready - no timeout check needed, just wait for min-wait and auto-approve
+	// Clear Stalled condition if it exists (step became ready, so no timeout)
 	if err := r.clearStalledCondition(ctx, &rollout); err != nil {
 		log.Error(err, "failed to clear Stalled condition")
 		// Non-fatal, continue
@@ -326,15 +379,7 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				"step", currentStepIndex,
 				"timeSinceReady", timeSinceReady,
 				"remaining", remaining)
-			// Requeue more frequently as we approach the deadline
-			requeueAfter := remaining
-			if time.Until(deadline) < remaining {
-				requeueAfter = time.Until(deadline)
-				if requeueAfter < 2*time.Second {
-					requeueAfter = 2 * time.Second
-				}
-			}
-			return ctrl.Result{RequeueAfter: requeueAfter}, nil
+			return ctrl.Result{RequeueAfter: remaining}, nil
 		}
 	}
 
@@ -389,9 +434,20 @@ func (r *RolloutStepGateReconciler) cleanupStepAnnotations(ctx context.Context, 
 		return nil
 	}
 
-	key := fmt.Sprintf(internalAnnotationStepReadyAtPrefix, stepIndex)
-	if _, exists := rollout.Annotations[key]; exists {
-		delete(rollout.Annotations, key)
+	updated := false
+	readyAtKey := fmt.Sprintf(internalAnnotationStepReadyAtPrefix, stepIndex)
+	if _, exists := rollout.Annotations[readyAtKey]; exists {
+		delete(rollout.Annotations, readyAtKey)
+		updated = true
+	}
+
+	startedAtKey := fmt.Sprintf(internalAnnotationStepStartedAtPrefix, stepIndex)
+	if _, exists := rollout.Annotations[startedAtKey]; exists {
+		delete(rollout.Annotations, startedAtKey)
+		updated = true
+	}
+
+	if updated {
 		return r.Update(ctx, rollout)
 	}
 
