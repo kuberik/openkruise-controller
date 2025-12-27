@@ -16,7 +16,10 @@ import (
 	"sigs.k8s.io/cli-utils/pkg/kstatus/status"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	rolloutv1alpha1 "github.com/kuberik/openkruise-operator/api/v1alpha1"
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
+	sourcev1 "github.com/fluxcd/source-controller/api/v1"
+	rolloutv1alpha1 "github.com/kuberik/openkruise-controller/api/v1alpha1"
+	kuberikrolloutv1alpha1 "github.com/kuberik/rollout-controller/api/v1alpha1"
 	kruiserolloutv1beta1 "github.com/openkruise/kruise-rollout-api/rollouts/v1beta1"
 )
 
@@ -413,6 +416,405 @@ var _ = Describe("RolloutStepGate Controller", func() {
 				Expect(stalledCondition.Status).To(Equal(corev1.ConditionFalse),
 					"Stalled condition should be cleared when observing new canary")
 			}
+		})
+	})
+
+	Context("When kuberik Rollout bake status is checked", func() {
+		var namespace string
+		var kruiseRollout *kruiserolloutv1beta1.Rollout
+		var kustomization *kustomizev1.Kustomization
+		var ociRepo *sourcev1.OCIRepository
+		var kuberikRollout *kuberikrolloutv1alpha1.Rollout
+
+		BeforeEach(func() {
+			ctx := context.Background()
+
+			By("creating a unique namespace for the test")
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					GenerateName: "test-ns-",
+				},
+			}
+			Expect(k8sClient.Create(ctx, ns)).To(Succeed())
+			namespace = ns.Name
+
+			By("creating the OCIRepository")
+			ociRepo = &sourcev1.OCIRepository{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-oci-repo",
+					Namespace: namespace,
+				},
+				Spec: sourcev1.OCIRepositorySpec{
+					URL: "oci://example.com/repo",
+				},
+			}
+			Expect(k8sClient.Create(ctx, ociRepo)).To(Succeed())
+
+			By("creating the Kustomization")
+			kustomization = &kustomizev1.Kustomization{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-kustomization",
+					Namespace: namespace,
+					Annotations: map[string]string{
+						"rollout.kuberik.com/substitute.version.from": "test-kuberik-rollout",
+					},
+				},
+				Spec: kustomizev1.KustomizationSpec{
+					SourceRef: kustomizev1.CrossNamespaceSourceReference{
+						Kind:      "OCIRepository",
+						Name:      "test-oci-repo",
+						Namespace: namespace,
+					},
+					Path: "./",
+				},
+			}
+			Expect(k8sClient.Create(ctx, kustomization)).To(Succeed())
+
+			By("creating the kuberik Rollout")
+			kuberikRollout = &kuberikrolloutv1alpha1.Rollout{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-kuberik-rollout",
+					Namespace: namespace,
+				},
+				Spec: kuberikrolloutv1alpha1.RolloutSpec{
+					ReleasesImagePolicy: corev1.LocalObjectReference{
+						Name: "test-image-policy",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, kuberikRollout)).To(Succeed())
+
+			By("updating kuberik Rollout status with failed bake status")
+			failedStatus := kuberikrolloutv1alpha1.BakeStatusFailed
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kuberik-rollout", Namespace: namespace}, kuberikRollout)).To(Succeed())
+			kuberikRollout.Status = kuberikrolloutv1alpha1.RolloutStatus{
+				History: []kuberikrolloutv1alpha1.DeploymentHistoryEntry{
+					{
+						ID: func() *int64 { id := int64(1); return &id }(),
+						Version: kuberikrolloutv1alpha1.VersionInfo{
+							Tag: "v1.0.0",
+						},
+						Timestamp:  metav1.Now(),
+						BakeStatus: &failedStatus,
+					},
+				},
+			}
+			Expect(k8sClient.Status().Update(ctx, kuberikRollout)).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kuberik-rollout", Namespace: namespace}, kuberikRollout)).To(Succeed())
+
+			By("creating the kruise Rollout with kustomize annotations")
+			kruiseRollout = &kruiserolloutv1beta1.Rollout{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-kruise-rollout",
+					Namespace: namespace,
+					Annotations: map[string]string{
+						"kustomize.toolkit.fluxcd.io/name":      "test-kustomization",
+						"kustomize.toolkit.fluxcd.io/namespace": namespace,
+					},
+				},
+				Spec: kruiserolloutv1beta1.RolloutSpec{
+					Strategy: kruiserolloutv1beta1.RolloutStrategy{
+						Canary: &kruiserolloutv1beta1.CanaryStrategy{
+							Steps: []kruiserolloutv1beta1.CanaryStep{
+								{
+									Replicas: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+									Pause: kruiserolloutv1beta1.RolloutPause{
+										Duration: func() *int32 { d := int32(3600); return &d }(),
+									},
+								},
+							},
+						},
+					},
+					WorkloadRef: kruiserolloutv1beta1.ObjectRef{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       "test-deployment",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, kruiseRollout)).To(Succeed())
+
+			By("updating kruise Rollout status with canary status")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kruise-rollout", Namespace: namespace}, kruiseRollout)).To(Succeed())
+			kruiseRollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{
+				CanaryRevision: "v1",
+			}
+			kruiseRollout.Status.CanaryStatus.CurrentStepIndex = 1
+			kruiseRollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			Expect(k8sClient.Status().Update(ctx, kruiseRollout)).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kruise-rollout", Namespace: namespace}, kruiseRollout)).To(Succeed())
+
+			By("creating a RolloutTest to trigger reconciliation")
+			rolloutTest := &rolloutv1alpha1.RolloutTest{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-rollouttest",
+					Namespace: namespace,
+				},
+				Spec: rolloutv1alpha1.RolloutTestSpec{
+					RolloutName: "test-kruise-rollout",
+					StepIndex:   1,
+					JobTemplate: batchv1.JobSpec{
+						Template: corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{
+									{Name: "test", Image: "busybox", Command: []string{"echo", "hello"}},
+								},
+								RestartPolicy: corev1.RestartPolicyNever,
+							},
+						},
+					},
+				},
+				Status: rolloutv1alpha1.RolloutTestStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:               "Ready",
+							Status:             metav1.ConditionTrue,
+							Reason:             "JobSucceeded",
+							Message:            "Test job succeeded",
+							LastTransitionTime: metav1.Now(),
+							ObservedGeneration: 1,
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, rolloutTest)).To(Succeed())
+			Expect(k8sClient.Status().Update(ctx, rolloutTest)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			ctx := context.Background()
+			By("Cleaning up the test namespace")
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: namespace,
+				},
+			}
+			Expect(k8sClient.Delete(ctx, ns)).To(Succeed())
+		})
+
+		It("should skip if rollout has no kustomize annotations", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Removing kustomize annotations")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kruise-rollout", Namespace: namespace}, kruiseRollout)).To(Succeed())
+			delete(kruiseRollout.Annotations, "kustomize.toolkit.fluxcd.io/name")
+			delete(kruiseRollout.Annotations, "kustomize.toolkit.fluxcd.io/namespace")
+			Expect(k8sClient.Update(ctx, kruiseRollout)).To(Succeed())
+
+			By("Reconciling - should skip kuberik rollout check")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-kruise-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying no Stalled condition was set with KuberikRolloutBakeFailed reason")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kruise-rollout", Namespace: namespace}, kruiseRollout)).To(Succeed())
+			if kruiseRollout.Status.Conditions != nil {
+				for _, condition := range kruiseRollout.Status.Conditions {
+					if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
+						Expect(condition.Reason).NotTo(Equal("KuberikRolloutBakeFailed"))
+					}
+				}
+			}
+		})
+
+		It("should skip if Kustomization is not found", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Deleting the Kustomization")
+			Expect(k8sClient.Delete(ctx, kustomization)).To(Succeed())
+
+			By("Reconciling - should skip when Kustomization not found")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-kruise-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("should skip if kuberik Rollout is not found", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Deleting the kuberik Rollout")
+			Expect(k8sClient.Delete(ctx, kuberikRollout)).To(Succeed())
+
+			By("Reconciling - should skip when kuberik Rollout not found")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-kruise-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("should skip if kuberik Rollout history is empty", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Clearing kuberik Rollout history")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kuberik-rollout", Namespace: namespace}, kuberikRollout)).To(Succeed())
+			kuberikRollout.Status.History = []kuberikrolloutv1alpha1.DeploymentHistoryEntry{}
+			Expect(k8sClient.Status().Update(ctx, kuberikRollout)).To(Succeed())
+
+			By("Reconciling - should skip when history is empty")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-kruise-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("should set Stalled condition when kuberik Rollout has failed bake status", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Verifying kuberik Rollout exists")
+			var testRollout kuberikrolloutv1alpha1.Rollout
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kuberik-rollout", Namespace: namespace}, &testRollout)).To(Succeed())
+			Expect(len(testRollout.Status.History)).To(BeNumerically(">", 0))
+			Expect(testRollout.Status.History[0].BakeStatus).NotTo(BeNil())
+			Expect(*testRollout.Status.History[0].BakeStatus).To(Equal(kuberikrolloutv1alpha1.BakeStatusFailed))
+
+			By("Verifying Kustomization has the annotation")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kustomization", Namespace: namespace}, kustomization)).To(Succeed())
+			Expect(kustomization.Annotations).NotTo(BeNil())
+			Expect(kustomization.Annotations["rollout.kuberik.com/substitute.version.from"]).To(Equal("test-kuberik-rollout"))
+
+			By("Verifying controller can find kuberik Rollout via Kustomization annotation")
+			// Manually test the findKuberikRolloutForKustomization function
+			foundRollout, err := controllerReconciler.findKuberikRolloutForKustomization(ctx, kustomization)
+			Expect(err).NotTo(HaveOccurred(), "findKuberikRolloutForKustomization should not return error")
+			Expect(foundRollout).NotTo(BeNil(), "findKuberikRolloutForKustomization should find the Rollout")
+			Expect(foundRollout.Name).To(Equal("test-kuberik-rollout"))
+			Expect(len(foundRollout.Status.History)).To(BeNumerically(">", 0))
+
+			By("Reconciling - should detect failed bake status and set Stalled condition")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-kruise-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying Stalled condition is set")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kruise-rollout", Namespace: namespace}, kruiseRollout)).To(Succeed())
+
+			var stalledCondition *kruiserolloutv1beta1.RolloutCondition
+			if kruiseRollout.Status.Conditions != nil {
+				for i := range kruiseRollout.Status.Conditions {
+					if kruiseRollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
+						stalledCondition = &kruiseRollout.Status.Conditions[i]
+						break
+					}
+				}
+			}
+			Expect(stalledCondition).NotTo(BeNil(), "Stalled condition should be set when kuberik Rollout has failed bake status")
+			Expect(stalledCondition.Status).To(Equal(corev1.ConditionTrue))
+			Expect(stalledCondition.Reason).To(Equal("KuberikRolloutBakeFailed"))
+			Expect(stalledCondition.Message).To(ContainSubstring("test-kuberik-rollout"))
+			Expect(stalledCondition.Message).To(ContainSubstring("failed bake status"))
+		})
+
+		It("should not set Stalled condition when kuberik Rollout has succeeded bake status", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Updating kuberik Rollout to have succeeded bake status")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kuberik-rollout", Namespace: namespace}, kuberikRollout)).To(Succeed())
+			succeededStatus := kuberikrolloutv1alpha1.BakeStatusSucceeded
+			kuberikRollout.Status.History[0].BakeStatus = &succeededStatus
+			Expect(k8sClient.Status().Update(ctx, kuberikRollout)).To(Succeed())
+
+			By("Reconciling - should not set Stalled condition")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-kruise-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying Stalled condition is not set with KuberikRolloutBakeFailed reason")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kruise-rollout", Namespace: namespace}, kruiseRollout)).To(Succeed())
+			if kruiseRollout.Status.Conditions != nil {
+				for _, condition := range kruiseRollout.Status.Conditions {
+					if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") && condition.Reason == "KuberikRolloutBakeFailed" {
+						Fail("Stalled condition should not be set with KuberikRolloutBakeFailed reason when bake succeeded")
+					}
+				}
+			}
+		})
+
+		It("should find kuberik Rollout via OCIRepository annotation", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Setting up OCIRepository to reference kuberik Rollout via annotation")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-oci-repo", Namespace: namespace}, ociRepo)).To(Succeed())
+			if ociRepo.Annotations == nil {
+				ociRepo.Annotations = make(map[string]string)
+			}
+			ociRepo.Annotations["rollout.kuberik.com/name"] = "test-kuberik-rollout"
+			ociRepo.Annotations["rollout.kuberik.com/namespace"] = namespace
+			Expect(k8sClient.Update(ctx, ociRepo)).To(Succeed())
+
+			By("Reconciling - should find kuberik Rollout via OCIRepository and set Stalled condition")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-kruise-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying Stalled condition is set")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kruise-rollout", Namespace: namespace}, kruiseRollout)).To(Succeed())
+
+			var stalledCondition *kruiserolloutv1beta1.RolloutCondition
+			if kruiseRollout.Status.Conditions != nil {
+				for i := range kruiseRollout.Status.Conditions {
+					if kruiseRollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
+						stalledCondition = &kruiseRollout.Status.Conditions[i]
+						break
+					}
+				}
+			}
+			Expect(stalledCondition).NotTo(BeNil())
+			Expect(stalledCondition.Status).To(Equal(corev1.ConditionTrue))
+			Expect(stalledCondition.Reason).To(Equal("KuberikRolloutBakeFailed"))
 		})
 	})
 })

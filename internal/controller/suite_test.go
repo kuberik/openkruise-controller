@@ -32,7 +32,10 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	rolloutv1alpha1 "github.com/kuberik/openkruise-operator/api/v1alpha1"
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
+	sourcev1 "github.com/fluxcd/source-controller/api/v1"
+	rolloutv1alpha1 "github.com/kuberik/openkruise-controller/api/v1alpha1"
+	kuberikrolloutv1alpha1 "github.com/kuberik/rollout-controller/api/v1alpha1"
 	kruiserolloutv1beta1 "github.com/openkruise/kruise-rollout-api/rollouts/v1beta1"
 	// +kubebuilder:scaffold:imports
 )
@@ -66,13 +69,25 @@ var _ = BeforeSuite(func() {
 	err = kruiserolloutv1beta1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 
+	err = kustomizev1.AddToScheme(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
+
+	err = sourcev1.AddToScheme(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
+
+	err = kuberikrolloutv1alpha1.AddToScheme(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
+
 	// +kubebuilder:scaffold:scheme
 
 	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{
 		CRDDirectoryPaths: []string{
 			filepath.Join("..", "..", "config", "crd", "bases"),
-			filepath.Join("..", "..", "config", "crd", "external"),
+			filepath.Join("..", "..", "config", "crd", "external", "rollouts.kruise.io_rollouts.yaml", "rollouts.kruise.io_rollouts.yaml"),
+			filepath.Join("..", "..", "config", "crd", "external", "kustomize.toolkit.fluxcd.io_kustomizations.yaml", "kustomize.toolkit.fluxcd.io_kustomizations.yaml"),
+			filepath.Join("..", "..", "config", "crd", "external", "source.toolkit.fluxcd.io_ocirepositories.yaml", "source.toolkit.fluxcd.io_ocirepositories.yaml"),
+			filepath.Join("..", "..", "config", "crd", "external", "kuberik.com_rollouts.yaml", "kuberik.com_rollouts.yaml"),
 		},
 		ErrorIfCRDPathMissing: true,
 	}

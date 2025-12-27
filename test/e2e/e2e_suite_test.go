@@ -28,7 +28,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/kuberik/openkruise-operator/test/utils"
+	"github.com/kuberik/openkruise-controller/test/utils"
 )
 
 var (

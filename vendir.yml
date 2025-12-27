@@ -4,6 +4,15 @@ minimumRequiredVersion: 0.12.0
 directories:
 - path: config/crd/external
   contents:
-  - path: .
+  - path: rollouts.kruise.io_rollouts.yaml
     http:
       url: https://raw.githubusercontent.com/openkruise/rollouts/refs/tags/v0.6.2/config/crd/bases/rollouts.kruise.io_rollouts.yaml
+  - path: kustomize.toolkit.fluxcd.io_kustomizations.yaml
+    http:
+      url: https://raw.githubusercontent.com/fluxcd/kustomize-controller/refs/tags/v1.7.3/config/crd/bases/kustomize.toolkit.fluxcd.io_kustomizations.yaml
+  - path: source.toolkit.fluxcd.io_ocirepositories.yaml
+    http:
+      url: https://raw.githubusercontent.com/fluxcd/source-controller/refs/tags/v1.7.4/config/crd/bases/source.toolkit.fluxcd.io_ocirepositories.yaml
+  - path: kuberik.com_rollouts.yaml
+    http:
+      url: https://raw.githubusercontent.com/kuberik/rollout-controller/refs/tags/v0.5.0/config/crd/bases/kuberik.com_rollouts.yaml

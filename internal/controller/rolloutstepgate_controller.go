@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -32,7 +33,10 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	rolloutv1alpha1 "github.com/kuberik/openkruise-operator/api/v1alpha1"
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
+	sourcev1 "github.com/fluxcd/source-controller/api/v1"
+	rolloutv1alpha1 "github.com/kuberik/openkruise-controller/api/v1alpha1"
+	kuberikrolloutv1alpha1 "github.com/kuberik/rollout-controller/api/v1alpha1"
 	kruiserolloutv1beta1 "github.com/openkruise/kruise-rollout-api/rollouts/v1beta1"
 )
 
@@ -62,6 +66,9 @@ type RolloutStepGateReconciler struct {
 // +kubebuilder:rbac:groups=rollouts.kruise.io,resources=rollouts,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=rollouts.kruise.io,resources=rollouts/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=rollout.kuberik.com,resources=rollouttests,verbs=get;list;watch
+// +kubebuilder:rbac:groups=kuberik.com,resources=rollouts,verbs=get;list;watch
+// +kubebuilder:rbac:groups=kustomize.toolkit.fluxcd.io,resources=kustomizations,verbs=get;list;watch
+// +kubebuilder:rbac:groups=source.toolkit.fluxcd.io,resources=ocirepositories,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop
 func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -90,6 +97,17 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if err := r.clearStalledConditionIfNewCanary(ctx, &rollout, currentRevision); err != nil {
 		log.Error(err, "failed to check/clear Stalled condition for new canary")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+	}
+
+	// Check if rollout was deployed by kustomize and if kuberik rollout has failed bake status
+	if err := r.checkKuberikRolloutBakeStatus(ctx, &rollout); err != nil {
+		log.Error(err, "failed to check kuberik rollout bake status")
+		// Non-fatal, continue with normal flow
+	}
+
+	// Refetch rollout after checking kuberik bake status to ensure we have latest status
+	if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
 	lastRevisionStr := r.getStepAnnotation(&rollout, currentStepIndex, internalAnnotationStepLastRevisionPrefix)
@@ -601,15 +619,18 @@ func (r *RolloutStepGateReconciler) extractCanaryRevisionFromMessage(message str
 }
 
 // clearStalledCondition clears the Stalled condition on the Rollout
+// It does NOT clear conditions with Reason "KuberikRolloutBakeFailed" as those should persist
 func (r *RolloutStepGateReconciler) clearStalledCondition(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) error {
 	if rollout.Status.Conditions == nil {
 		return nil
 	}
 
-	// Check if Stalled condition exists and is True
+	// Check if Stalled condition exists and is True, but not for kuberik bake failure
 	stalledExists := false
 	for _, condition := range rollout.Status.Conditions {
-		if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") && condition.Status == corev1.ConditionTrue {
+		if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") &&
+			condition.Status == corev1.ConditionTrue &&
+			condition.Reason != "KuberikRolloutBakeFailed" {
 			stalledExists = true
 			break
 		}
@@ -626,10 +647,11 @@ func (r *RolloutStepGateReconciler) clearStalledCondition(ctx context.Context, r
 		return err
 	}
 
-	// Update the condition to False
+	// Update the condition to False (only if not KuberikRolloutBakeFailed)
 	now := metav1.Now()
 	for i := range rollout.Status.Conditions {
-		if rollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
+		if rollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") &&
+			rollout.Status.Conditions[i].Reason != "KuberikRolloutBakeFailed" {
 			rollout.Status.Conditions[i].Status = corev1.ConditionFalse
 			rollout.Status.Conditions[i].Reason = "WithinDeadline"
 			rollout.Status.Conditions[i].Message = "Step is within max-wait deadline"
@@ -640,6 +662,244 @@ func (r *RolloutStepGateReconciler) clearStalledCondition(ctx context.Context, r
 	}
 
 	return r.Status().Update(ctx, rollout)
+}
+
+// checkKuberikRolloutBakeStatus checks if the rollout was deployed by kustomize and if the
+// associated kuberik Rollout has a failed bake status in its latest history entry.
+// If so, sets the Stalled condition.
+func (r *RolloutStepGateReconciler) checkKuberikRolloutBakeStatus(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) error {
+	log := logf.FromContext(ctx)
+
+	// Check if rollout has kustomize annotations
+	kustomizeName := rollout.Annotations["kustomize.toolkit.fluxcd.io/name"]
+	kustomizeNamespace := rollout.Annotations["kustomize.toolkit.fluxcd.io/namespace"]
+	if kustomizeName == "" || kustomizeNamespace == "" {
+		// Not deployed by kustomize, skip
+		return nil
+	}
+
+	// Get the Kustomization resource
+	var kustomization kustomizev1.Kustomization
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      kustomizeName,
+		Namespace: kustomizeNamespace,
+	}, &kustomization); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			// Kustomization not found, skip
+			return nil
+		}
+		return fmt.Errorf("failed to get Kustomization %s/%s: %w", kustomizeNamespace, kustomizeName, err)
+	}
+
+	// Find the kuberik Rollout that references this Kustomization
+	// We'll look for Rollouts that have annotations referencing this Kustomization
+	// or check the OCIRepository that the Kustomization references
+	kuberikRollout, err := r.findKuberikRolloutForKustomization(ctx, &kustomization)
+	if err != nil {
+		return fmt.Errorf("failed to find kuberik Rollout for Kustomization: %w", err)
+	}
+	if kuberikRollout == nil {
+		// No kuberik Rollout found, skip
+		return nil
+	}
+
+	// Check if the latest history entry has failed bake status
+	if len(kuberikRollout.Status.History) == 0 {
+		return nil
+	}
+
+	latestEntry := kuberikRollout.Status.History[0]
+	if latestEntry.BakeStatus != nil && *latestEntry.BakeStatus == kuberikrolloutv1alpha1.BakeStatusFailed {
+		// Latest entry has failed bake status, set Stalled condition
+		log.Info("Kuberik Rollout has failed bake status, setting Stalled condition",
+			"kuberikRollout", kuberikRollout.Name,
+			"kuberikRolloutNamespace", kuberikRollout.Namespace,
+			"bakeStatus", *latestEntry.BakeStatus)
+
+		// Set Stalled condition with message indicating kuberik rollout bake failure
+		currentRevision := rollout.Status.CanaryStatus.CanaryRevision
+		message := fmt.Sprintf("Kuberik Rollout %s/%s has failed bake status in latest deployment. Rollout is paused and requires manual intervention.", kuberikRollout.Namespace, kuberikRollout.Name)
+		if currentRevision != "" {
+			message = fmt.Sprintf("Kuberik Rollout %s/%s has failed bake status in latest deployment for canary %s. Rollout is paused and requires manual intervention.", kuberikRollout.Namespace, kuberikRollout.Name, currentRevision)
+		}
+		err := r.setStalledConditionForKuberikBakeFailure(ctx, rollout, message)
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// If bake status is not failed, clear any existing Stalled condition with KuberikRolloutBakeFailed reason
+	if rollout.Status.Conditions != nil {
+		for _, condition := range rollout.Status.Conditions {
+			if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") &&
+				condition.Status == corev1.ConditionTrue &&
+				condition.Reason == "KuberikRolloutBakeFailed" {
+				// Clear the condition
+				return r.clearStalledCondition(ctx, rollout)
+			}
+		}
+	}
+
+	return nil
+}
+
+// findKuberikRolloutForKustomization finds the kuberik Rollout that references the given Kustomization.
+// It checks:
+// 1. Kustomization annotations for rollout references
+// 2. OCIRepository that the Kustomization references
+// 3. List all Rollouts and check for matching references
+func (r *RolloutStepGateReconciler) findKuberikRolloutForKustomization(ctx context.Context, kustomization *kustomizev1.Kustomization) (*kuberikrolloutv1alpha1.Rollout, error) {
+	log := logf.FromContext(ctx)
+
+	// First, check if Kustomization has annotations that reference a kuberik Rollout
+	// Look for annotations like "rollout.kuberik.com/substitute.*.from"
+	if kustomization.Annotations != nil {
+		for key, value := range kustomization.Annotations {
+			if strings.HasPrefix(key, "rollout.kuberik.com/substitute.") && strings.HasSuffix(key, ".from") {
+				// Found a rollout reference, try to get it
+				rolloutName := value
+				// Try in the same namespace as the Kustomization first
+				var rollout kuberikrolloutv1alpha1.Rollout
+				err := r.Get(ctx, types.NamespacedName{
+					Name:      rolloutName,
+					Namespace: kustomization.Namespace,
+				}, &rollout)
+				if err == nil {
+					log.V(5).Info("Found kuberik Rollout via Kustomization annotation",
+						"rollout", rolloutName,
+						"namespace", kustomization.Namespace)
+					return &rollout, nil
+				}
+				// If Get failed, log but continue to check OCIRepository path
+				log.V(5).Info("Failed to get kuberik Rollout via Kustomization annotation, will try OCIRepository",
+					"rollout", rolloutName,
+					"namespace", kustomization.Namespace,
+					"error", err)
+			}
+		}
+	}
+
+	// If Kustomization references an OCIRepository, check if any Rollout references it
+	if kustomization.Spec.SourceRef.Kind == "OCIRepository" {
+		ociRepoName := kustomization.Spec.SourceRef.Name
+		ociRepoNamespace := kustomization.Namespace
+		if kustomization.Spec.SourceRef.Namespace != "" {
+			ociRepoNamespace = kustomization.Spec.SourceRef.Namespace
+		}
+
+		// Get the OCIRepository
+		var ociRepo sourcev1.OCIRepository
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      ociRepoName,
+			Namespace: ociRepoNamespace,
+		}, &ociRepo); err != nil {
+			if client.IgnoreNotFound(err) == nil {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("failed to get OCIRepository %s/%s: %w", ociRepoNamespace, ociRepoName, err)
+		}
+
+		// Check if OCIRepository has annotations referencing a kuberik Rollout
+		if ociRepo.Annotations != nil {
+			// Look for direct rollout reference annotation
+			if rolloutName, exists := ociRepo.Annotations["rollout.kuberik.com/name"]; exists {
+				rolloutNamespace := ociRepoNamespace
+				if ns, exists := ociRepo.Annotations["rollout.kuberik.com/namespace"]; exists {
+					rolloutNamespace = ns
+				}
+				var rollout kuberikrolloutv1alpha1.Rollout
+				if err := r.Get(ctx, types.NamespacedName{
+					Name:      rolloutName,
+					Namespace: rolloutNamespace,
+				}, &rollout); err == nil {
+					log.V(5).Info("Found kuberik Rollout via OCIRepository annotation",
+						"rollout", rolloutName,
+						"namespace", rolloutNamespace)
+					return &rollout, nil
+				}
+			}
+			// Also check for other rollout.kuberik.com annotations
+			for key, value := range ociRepo.Annotations {
+				if strings.HasPrefix(key, "rollout.kuberik.com/") && key != "rollout.kuberik.com/namespace" {
+					rolloutName := value
+					var rollout kuberikrolloutv1alpha1.Rollout
+					if err := r.Get(ctx, types.NamespacedName{
+						Name:      rolloutName,
+						Namespace: ociRepoNamespace,
+					}, &rollout); err == nil {
+						log.V(5).Info("Found kuberik Rollout via OCIRepository annotation",
+							"rollout", rolloutName,
+							"namespace", ociRepoNamespace,
+							"annotation", key)
+						return &rollout, nil
+					}
+				}
+			}
+		}
+	}
+
+	return nil, nil
+}
+
+// setStalledConditionForKuberikBakeFailure sets the Stalled condition when kuberik rollout bake fails
+func (r *RolloutStepGateReconciler) setStalledConditionForKuberikBakeFailure(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout, message string) error {
+	// Refetch rollout to ensure we have latest resource version before status update
+	// This is important to avoid conflicts
+	namespacedName := types.NamespacedName{Name: rollout.Name, Namespace: rollout.Namespace}
+	if err := r.Get(ctx, namespacedName, rollout); err != nil {
+		return err
+	}
+
+	// Check if condition already exists and is up to date
+	if rollout.Status.Conditions != nil {
+		for _, condition := range rollout.Status.Conditions {
+			if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") &&
+				condition.Status == corev1.ConditionTrue &&
+				condition.Reason == "KuberikRolloutBakeFailed" {
+				// Condition already set with same reason, no need to update
+				return nil
+			}
+		}
+	}
+
+	// Initialize conditions slice if nil
+	if rollout.Status.Conditions == nil {
+		rollout.Status.Conditions = []kruiserolloutv1beta1.RolloutCondition{}
+	}
+
+	now := metav1.Now()
+
+	// Find and update existing condition or add new one
+	found := false
+	for i := range rollout.Status.Conditions {
+		if rollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
+			rollout.Status.Conditions[i].Status = corev1.ConditionTrue
+			rollout.Status.Conditions[i].Reason = "KuberikRolloutBakeFailed"
+			rollout.Status.Conditions[i].Message = message
+			rollout.Status.Conditions[i].LastTransitionTime = now
+			rollout.Status.Conditions[i].LastUpdateTime = now
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		rollout.Status.Conditions = append(rollout.Status.Conditions, kruiserolloutv1beta1.RolloutCondition{
+			Type:               kruiserolloutv1beta1.RolloutConditionType("Stalled"),
+			Status:             corev1.ConditionTrue,
+			Reason:             "KuberikRolloutBakeFailed",
+			Message:            message,
+			LastTransitionTime: now,
+			LastUpdateTime:     now,
+		})
+	}
+
+	err := r.Status().Update(ctx, rollout)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

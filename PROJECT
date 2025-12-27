@@ -7,7 +7,7 @@ domain: kuberik.com
 layout:
 - go.kubebuilder.io/v4
 projectName: openkruise-controller
-repo: github.com/kuberik/openkruise-operator
+repo: github.com/kuberik/openkruise-controller
 resources:
 - api:
     crdVersion: v1
@@ -16,6 +16,6 @@ resources:
   domain: kuberik.com
   group: rollout
   kind: RolloutTest
-  path: github.com/kuberik/openkruise-operator/api/v1alpha1
+  path: github.com/kuberik/openkruise-controller/api/v1alpha1
   version: v1alpha1
 version: "3"

@@ -35,8 +35,8 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	rolloutv1alpha1 "github.com/kuberik/openkruise-operator/api/v1alpha1"
-	"github.com/kuberik/openkruise-operator/internal/controller"
+	rolloutv1alpha1 "github.com/kuberik/openkruise-controller/api/v1alpha1"
+	"github.com/kuberik/openkruise-controller/internal/controller"
 	kruiserolloutv1beta1 "github.com/openkruise/kruise-rollout-api/rollouts/v1beta1"
 	// +kubebuilder:scaffold:imports
 )

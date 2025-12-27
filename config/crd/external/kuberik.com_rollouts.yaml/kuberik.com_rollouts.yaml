@@ -1,0 +1,534 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.17.2
+  name: rollouts.kuberik.com
+spec:
+  group: kuberik.com
+  names:
+    kind: Rollout
+    listKind: RolloutList
+    plural: rollouts
+    singular: rollout
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.history[0].version.tag
+      name: Version
+      type: string
+    - jsonPath: .status.history[0].message
+      name: Message
+      type: string
+    - jsonPath: .status.history[0].bakeStatus
+      name: BakeStatus
+      type: string
+    - jsonPath: .status.history[0].bakeStartTime
+      name: BakeTime
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="GatesPassing")].status
+      name: Gates
+      type: string
+    - jsonPath: .status.availableReleases
+      name: Available
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Ready")].message
+      name: Status
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Rollout is the Schema for the rollouts API.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: RolloutSpec defines the desired state of Rollout.
+            properties:
+              bakeTime:
+                description: |-
+                  BakeTime specifies how long to wait after bake starts before marking as successful
+                  If no errors happen within the bake time, the rollout is baked successfully.
+                  If not specified, no bake time is enforced.
+                pattern: ^([0-9]+(\.[0-9]+)?(ms|s|m|h))+$
+                type: string
+              deployTimeout:
+                description: |-
+                  DeployTimeout specifies the maximum time to wait for bake to start before marking as failed
+                  If bake doesn't start within deployTimeout (i.e., health checks don't become healthy),
+                  the rollout should be marked as failed.
+                  If not specified, the rollout will wait indefinitely for bake to start.
+                pattern: ^([0-9]+(\.[0-9]+)?(ms|s|m|h))+$
+                type: string
+              healthCheckSelector:
+                description: HealthCheckSelector specifies how to select HealthChecks
+                  for this rollout
+                properties:
+                  namespaceSelector:
+                    description: |-
+                      NamespaceSelector specifies the namespace selector for matching HealthChecks
+                      If not specified, only HealthChecks in the same namespace as the Rollout will be considered
+                    properties:
+                      matchExpressions:
+                        description: matchExpressions is a list of label selector
+                          requirements. The requirements are ANDed.
+                        items:
+                          description: |-
+                            A label selector requirement is a selector that contains values, a key, and an operator that
+                            relates the key and values.
+                          properties:
+                            key:
+                              description: key is the label key that the selector
+                                applies to.
+                              type: string
+                            operator:
+                              description: |-
+                                operator represents a key's relationship to a set of values.
+                                Valid operators are In, NotIn, Exists and DoesNotExist.
+                              type: string
+                            values:
+                              description: |-
+                                values is an array of string values. If the operator is In or NotIn,
+                                the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                the values array must be empty. This array is replaced during a strategic
+                                merge patch.
+                              items:
+                                type: string
+                              type: array
+                              x-kubernetes-list-type: atomic
+                          required:
+                          - key
+                          - operator
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      matchLabels:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                          map is equivalent to an element of matchExpressions, whose key field is "key", the
+                          operator is "In", and the values array contains only "value". The requirements are ANDed.
+                        type: object
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  selector:
+                    description: Selector specifies the label selector for matching
+                      HealthChecks
+                    properties:
+                      matchExpressions:
+                        description: matchExpressions is a list of label selector
+                          requirements. The requirements are ANDed.
+                        items:
+                          description: |-
+                            A label selector requirement is a selector that contains values, a key, and an operator that
+                            relates the key and values.
+                          properties:
+                            key:
+                              description: key is the label key that the selector
+                                applies to.
+                              type: string
+                            operator:
+                              description: |-
+                                operator represents a key's relationship to a set of values.
+                                Valid operators are In, NotIn, Exists and DoesNotExist.
+                              type: string
+                            values:
+                              description: |-
+                                values is an array of string values. If the operator is In or NotIn,
+                                the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                the values array must be empty. This array is replaced during a strategic
+                                merge patch.
+                              items:
+                                type: string
+                              type: array
+                              x-kubernetes-list-type: atomic
+                          required:
+                          - key
+                          - operator
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      matchLabels:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                          map is equivalent to an element of matchExpressions, whose key field is "key", the
+                          operator is "In", and the values array contains only "value". The requirements are ANDed.
+                        type: object
+                    type: object
+                    x-kubernetes-map-type: atomic
+                type: object
+              releasesImagePolicy:
+                description: ReleasesImagePolicy specifies the ImagePolicy that provides
+                  available releases
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              versionHistoryLimit:
+                default: 5
+                description: VersionHistoryLimit defines the maximum number of entries
+                  to keep in the deployment history
+                format: int32
+                minimum: 1
+                type: integer
+              wantedVersion:
+                description: WantedVersion specifies a specific version to deploy,
+                  overriding the automatic version selection
+                type: string
+            required:
+            - releasesImagePolicy
+            type: object
+          status:
+            description: RolloutStatus defines the observed state of Rollout.
+            properties:
+              artifactType:
+                description: |-
+                  ArtifactType is the media/artifact type of the image extracted from the manifest.
+                  This includes OCI artifact types, container image types, and other media types.
+                  This field is set once for the entire rollout based on the latest available release.
+                type: string
+              availableReleases:
+                description: AvailableReleases is a list of all releases available
+                  in the releases repository.
+                items:
+                  description: VersionInfo represents detailed information about a
+                    version.
+                  properties:
+                    created:
+                      description: Created is the creation timestamp extracted from
+                        OCI annotations if available.
+                      format: date-time
+                      type: string
+                    digest:
+                      description: Digest is the image digest if available from the
+                        ImagePolicy.
+                      type: string
+                    revision:
+                      description: Revision is the revision information extracted
+                        from OCI annotations if available.
+                      type: string
+                    tag:
+                      description: Tag is the image tag (e.g., "v1.2.3", "latest").
+                      type: string
+                    version:
+                      description: Version is the semantic version extracted from
+                        OCI annotations if available.
+                      type: string
+                  required:
+                  - tag
+                  type: object
+                type: array
+              conditions:
+                description: Conditions represents the current state of the rollout
+                  process.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              description:
+                description: |-
+                  Description is the description of the image extracted from OCI annotations.
+                  This field is set once for the entire rollout based on the latest available release.
+                type: string
+              gatedReleaseCandidates:
+                description: |-
+                  GatedReleaseCandidates is a list of release candidates that have passed through all gates.
+                  This shows which versions are actually available for deployment after gate evaluation.
+                items:
+                  description: VersionInfo represents detailed information about a
+                    version.
+                  properties:
+                    created:
+                      description: Created is the creation timestamp extracted from
+                        OCI annotations if available.
+                      format: date-time
+                      type: string
+                    digest:
+                      description: Digest is the image digest if available from the
+                        ImagePolicy.
+                      type: string
+                    revision:
+                      description: Revision is the revision information extracted
+                        from OCI annotations if available.
+                      type: string
+                    tag:
+                      description: Tag is the image tag (e.g., "v1.2.3", "latest").
+                      type: string
+                    version:
+                      description: Version is the semantic version extracted from
+                        OCI annotations if available.
+                      type: string
+                  required:
+                  - tag
+                  type: object
+                type: array
+              gates:
+                description: Gates summarizes the status of each gate relevant to
+                  this rollout.
+                items:
+                  description: RolloutGateStatusSummary summarizes the status of a
+                    gate relevant to this rollout.
+                  properties:
+                    allowedVersions:
+                      description: AllowedVersions is a list of versions that are
+                        allowed by the gate.
+                      items:
+                        type: string
+                      type: array
+                    bypassGates:
+                      description: BypassGates indicates whether this gate was bypassed
+                        for the current deployment.
+                      type: boolean
+                    message:
+                      description: Message is a message describing the status of the
+                        gate.
+                      type: string
+                    name:
+                      description: Name is the name of the gate.
+                      type: string
+                    passing:
+                      description: Passing is true if the gate is passing, false if
+                        it is blocking.
+                      type: boolean
+                  required:
+                  - name
+                  type: object
+                type: array
+              history:
+                description: |-
+                  History tracks the deployment history of this Rollout.
+                  Each entry contains the version deployed and the timestamp of the deployment.
+                items:
+                  description: DeploymentHistoryEntry represents a single entry in
+                    the deployment history.
+                  properties:
+                    bakeEndTime:
+                      description: |-
+                        BakeEndTime is the time when the bake period ended for this deployment
+                        This is when the bake process completed (either successfully or with failure).
+                      format: date-time
+                      type: string
+                    bakeStartTime:
+                      description: |-
+                        BakeStartTime is the time when the bake period started for this deployment
+                        This is when the rollout controller began monitoring the deployment for stability.
+                      format: date-time
+                      type: string
+                    bakeStatus:
+                      description: |-
+                        BakeStatus tracks the bake state for this deployment (e.g., None, InProgress, Succeeded, Failed, Cancelled)
+                        The bake process ensures that the deployment is stable and healthy before marking as successful.
+                      type: string
+                    bakeStatusMessage:
+                      description: |-
+                        BakeStatusMessage provides details about the bake state for this deployment
+                        This field contains human-readable information about why the bake status is what it is.
+                      type: string
+                    failedHealthChecks:
+                      description: |-
+                        FailedHealthChecks contains all health checks that failed during bake.
+                        This field is populated when bake fails due to health check errors.
+                      items:
+                        description: FailedHealthCheck represents a health check that
+                          failed during bake.
+                        properties:
+                          message:
+                            description: Message is the error message from the health
+                              check.
+                            type: string
+                          name:
+                            description: Name is the name of the health check.
+                            type: string
+                          namespace:
+                            description: Namespace is the namespace of the health
+                              check.
+                            type: string
+                        required:
+                        - name
+                        - namespace
+                        type: object
+                      type: array
+                    id:
+                      description: ID is a unique auto-incrementing identifier for
+                        this history entry.
+                      format: int64
+                      type: integer
+                    message:
+                      description: |-
+                        Message provides a descriptive message about this deployment entry
+                        This field contains human-readable information about the deployment context.
+                        For automatic deployments, it includes information about gate bypass and failed bake unblock.
+                        For manual deployments (when wantedVersion is specified), it can contain a custom message
+                        provided via the "rollout.kuberik.com/deployment-message" annotation, or defaults to "Manual deployment".
+                      type: string
+                    timestamp:
+                      description: Timestamp is the time when the deployment occurred.
+                      format: date-time
+                      type: string
+                    version:
+                      description: Version is the version information that was deployed.
+                      properties:
+                        created:
+                          description: Created is the creation timestamp extracted
+                            from OCI annotations if available.
+                          format: date-time
+                          type: string
+                        digest:
+                          description: Digest is the image digest if available from
+                            the ImagePolicy.
+                          type: string
+                        revision:
+                          description: Revision is the revision information extracted
+                            from OCI annotations if available.
+                          type: string
+                        tag:
+                          description: Tag is the image tag (e.g., "v1.2.3", "latest").
+                          type: string
+                        version:
+                          description: Version is the semantic version extracted from
+                            OCI annotations if available.
+                          type: string
+                      required:
+                      - tag
+                      type: object
+                  required:
+                  - timestamp
+                  - version
+                  type: object
+                type: array
+              releaseCandidates:
+                description: |-
+                  ReleaseCandidates is a list of releases that are candidates for the next deployment.
+                  These are filtered from AvailableReleases based on deployment history and version ordering.
+                items:
+                  description: VersionInfo represents detailed information about a
+                    version.
+                  properties:
+                    created:
+                      description: Created is the creation timestamp extracted from
+                        OCI annotations if available.
+                      format: date-time
+                      type: string
+                    digest:
+                      description: Digest is the image digest if available from the
+                        ImagePolicy.
+                      type: string
+                    revision:
+                      description: Revision is the revision information extracted
+                        from OCI annotations if available.
+                      type: string
+                    tag:
+                      description: Tag is the image tag (e.g., "v1.2.3", "latest").
+                      type: string
+                    version:
+                      description: Version is the semantic version extracted from
+                        OCI annotations if available.
+                      type: string
+                  required:
+                  - tag
+                  type: object
+                type: array
+              source:
+                description: |-
+                  Source is the source information extracted from OCI annotations.
+                  This typically contains the repository URL or source code location.
+                  This field is set once for the entire rollout based on the latest available release.
+                type: string
+              title:
+                description: |-
+                  Title is the title of the image extracted from OCI annotations.
+                  This field is set once for the entire rollout based on the latest available release.
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

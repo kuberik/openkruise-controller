@@ -2,6 +2,12 @@ apiVersion: vendir.k14s.io/v1alpha1
 directories:
 - contents:
   - http: {}
-    path: .
+    path: rollouts.kruise.io_rollouts.yaml
+  - http: {}
+    path: kustomize.toolkit.fluxcd.io_kustomizations.yaml
+  - http: {}
+    path: source.toolkit.fluxcd.io_ocirepositories.yaml
+  - http: {}
+    path: kuberik.com_rollouts.yaml
   path: config/crd/external
 kind: LockConfig

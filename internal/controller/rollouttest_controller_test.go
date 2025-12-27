@@ -16,7 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	rolloutv1alpha1 "github.com/kuberik/openkruise-operator/api/v1alpha1"
+	rolloutv1alpha1 "github.com/kuberik/openkruise-controller/api/v1alpha1"
 	kruiserolloutv1beta1 "github.com/openkruise/kruise-rollout-api/rollouts/v1beta1"
 )
 
