@@ -179,7 +179,18 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 	lastStepIndexStr := rollout.Annotations[internalAnnotationLastStepIndex]
 	if lastStepIndexStr != fmt.Sprintf("%d", currentStepIndex) {
-		// Step changed, record when this step started
+		// Step changed, clean up annotations for all other steps
+		if err := r.cleanupStepAnnotationsForOtherSteps(ctx, &rollout, currentStepIndex); err != nil {
+			log.Error(err, "failed to cleanup annotations for other steps")
+			// Non-fatal, continue
+		} else {
+			// Refetch rollout after cleanup to ensure we have latest state
+			if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+
+		// Record when this step started
 		now := time.Now()
 		rollout.Annotations[internalAnnotationLastStepIndex] = fmt.Sprintf("%d", currentStepIndex)
 		startedAtKey := fmt.Sprintf(internalAnnotationStepStartedAtPrefix, currentStepIndex)
@@ -318,15 +329,22 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	} else {
 		// Not ready yet - either step not paused or tests not all passed
 		// Clear readyAt annotation if it exists, since step is no longer ready
+		// Note: We only clear ready-at, not started-at (started-at tracks when step started, not when it became ready)
 		if readyAtStr != "" {
 			log.Info("Step no longer ready, clearing readyAt annotation", "step", currentStepIndex)
-			if err := r.cleanupStepAnnotations(ctx, &rollout, currentStepIndex); err != nil {
-				log.Error(err, "failed to clear readyAt annotation")
-				// Non-fatal, continue
-			} else {
-				// Refetch rollout after cleanup
-				if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
-					return ctrl.Result{}, err
+			readyAtKey := fmt.Sprintf(internalAnnotationStepReadyAtPrefix, currentStepIndex)
+			if rollout.Annotations != nil {
+				if _, exists := rollout.Annotations[readyAtKey]; exists {
+					delete(rollout.Annotations, readyAtKey)
+					if err := r.Update(ctx, &rollout); err != nil {
+						log.Error(err, "failed to clear readyAt annotation")
+						// Non-fatal, continue
+					} else {
+						// Refetch rollout after cleanup
+						if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
+							return ctrl.Result{}, err
+						}
+					}
 				}
 			}
 		}
@@ -445,6 +463,42 @@ func (r *RolloutStepGateReconciler) cleanupStepAnnotations(ctx context.Context, 
 	if _, exists := rollout.Annotations[startedAtKey]; exists {
 		delete(rollout.Annotations, startedAtKey)
 		updated = true
+	}
+
+	if updated {
+		return r.Update(ctx, rollout)
+	}
+
+	return nil
+}
+
+// cleanupStepAnnotationsForOtherSteps removes internal annotations for all steps except the current one
+func (r *RolloutStepGateReconciler) cleanupStepAnnotationsForOtherSteps(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout, currentStepIndex int32) error {
+	if rollout.Annotations == nil {
+		return nil
+	}
+
+	updated := false
+	prefixes := []string{
+		internalAnnotationStepStartedAtPrefix,
+		internalAnnotationStepReadyAtPrefix,
+		internalAnnotationStepLastRevisionPrefix,
+	}
+
+	// Iterate through a reasonable range of step indices to find and remove annotations for other steps
+	// Most rollouts won't have more than 100 steps, but we'll check up to 1000 to be safe
+	for stepIndex := int32(1); stepIndex <= 1000; stepIndex++ {
+		if stepIndex == currentStepIndex {
+			continue
+		}
+
+		for _, prefix := range prefixes {
+			key := fmt.Sprintf(prefix, stepIndex)
+			if _, exists := rollout.Annotations[key]; exists {
+				delete(rollout.Annotations, key)
+				updated = true
+			}
+		}
 	}
 
 	if updated {

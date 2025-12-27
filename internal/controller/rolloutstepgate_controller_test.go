@@ -48,6 +48,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 					Namespace: namespace,
 					Annotations: map[string]string{
 						"rollout.kuberik.io/step-1-max-wait": "1m",
+						"rollout.kuberik.io/step-2-max-wait": "1m",
 					},
 				},
 				Spec: kruiserolloutv1beta1.RolloutSpec{
@@ -591,6 +592,127 @@ var _ = Describe("RolloutStepGate Controller", func() {
 				Expect(stalledCondition.Status).To(Equal(corev1.ConditionFalse),
 					"Stalled condition should be cleared when observing new canary")
 			}
+		})
+
+		It("should cleanup annotations for previous steps when step changes", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Setting up Rollout at step 1 with annotations")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Status.CanaryStatus == nil {
+				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+			}
+			rollout.Status.CanaryStatus.CurrentStepIndex = 1
+			rollout.Status.CanaryStatus.CanaryRevision = "v1"
+			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			By("Setting up annotations for step 1")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Annotations == nil {
+				rollout.Annotations = make(map[string]string)
+			}
+			rollout.Annotations["internal.rollout.kuberik.io/last-step-index"] = "1"
+			rollout.Annotations["internal.rollout.kuberik.io/step-1-started-at"] = time.Now().Add(-10 * time.Minute).Format(time.RFC3339)
+			rollout.Annotations["internal.rollout.kuberik.io/step-1-ready-at"] = time.Now().Add(-5 * time.Minute).Format(time.RFC3339)
+			rollout.Annotations["internal.rollout.kuberik.io/step-1-last-revision"] = "v1"
+			// Also add some annotations for step 2 (should be cleaned up)
+			rollout.Annotations["internal.rollout.kuberik.io/step-2-started-at"] = time.Now().Add(-20 * time.Minute).Format(time.RFC3339)
+			rollout.Annotations["internal.rollout.kuberik.io/step-2-ready-at"] = time.Now().Add(-15 * time.Minute).Format(time.RFC3339)
+			rollout.Annotations["internal.rollout.kuberik.io/step-2-last-revision"] = "v0"
+			Expect(k8sClient.Update(ctx, rollout)).To(Succeed())
+
+			By("Setting up RolloutTest as NOT passed (still running) to prevent auto-approval")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollouttest", Namespace: namespace}, rolloutTest)).To(Succeed())
+			rolloutTest.Status.ObservedCanaryRevision = "v1"
+			now := metav1.Now()
+			rolloutTest.Status.Conditions = []metav1.Condition{
+				{
+					Type:               "Ready",
+					Status:             metav1.ConditionFalse,
+					Reason:             "JobInProgress",
+					Message:            "Test job is running",
+					LastTransitionTime: now,
+				},
+			}
+			Expect(k8sClient.Status().Update(ctx, rolloutTest)).To(Succeed())
+
+			By("Reconciling at step 1 - should keep step 1 annotations (step not ready, so no auto-approval)")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying step 1 annotations still exist")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			Expect(rollout.Annotations["internal.rollout.kuberik.io/step-1-started-at"]).NotTo(BeEmpty())
+			// ready-at should not be set since tests are not passed
+			_, readyAtExists := rollout.Annotations["internal.rollout.kuberik.io/step-1-ready-at"]
+			Expect(readyAtExists).To(BeFalse(), "ready-at should not be set when tests are not passed")
+			Expect(rollout.Annotations["internal.rollout.kuberik.io/step-1-last-revision"]).To(Equal("v1"))
+
+			By("Changing to step 2")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			// Add step 2 to the rollout spec if not already present
+			if len(rollout.Spec.Strategy.Canary.Steps) < 2 {
+				rollout.Spec.Strategy.Canary.Steps = append(rollout.Spec.Strategy.Canary.Steps, kruiserolloutv1beta1.CanaryStep{
+					Replicas: &intstr.IntOrString{Type: intstr.Int, IntVal: 2},
+					Pause: kruiserolloutv1beta1.RolloutPause{
+						Duration: func() *int32 { d := int32(3600); return &d }(),
+					},
+				})
+			}
+			if rollout.Annotations == nil {
+				rollout.Annotations = make(map[string]string)
+			}
+			rollout.Annotations["rollout.kuberik.io/step-2-max-wait"] = "1m"
+			Expect(k8sClient.Update(ctx, rollout)).To(Succeed())
+
+			// Update status separately - ensure CanaryStatus is initialized
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Status.CanaryStatus == nil {
+				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+			}
+			rollout.Status.CanaryStatus.CurrentStepIndex = 2
+			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			By("Refetching rollout to ensure status update is visible")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			Expect(rollout.Status.CanaryStatus.CurrentStepIndex).To(Equal(int32(2)), "CurrentStepIndex should be 2")
+
+			By("Reconciling at step 2 - should cleanup step 1 annotations and set step 2 annotations")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying step 1 annotations are removed")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			var exists bool
+			_, exists = rollout.Annotations["internal.rollout.kuberik.io/step-1-started-at"]
+			Expect(exists).To(BeFalse(), "step-1-started-at should be removed")
+			_, exists = rollout.Annotations["internal.rollout.kuberik.io/step-1-ready-at"]
+			Expect(exists).To(BeFalse(), "step-1-ready-at should be removed")
+			_, exists = rollout.Annotations["internal.rollout.kuberik.io/step-1-last-revision"]
+			Expect(exists).To(BeFalse(), "step-1-last-revision should be removed")
+
+			By("Verifying step 2 annotations are set")
+			Expect(rollout.Annotations["internal.rollout.kuberik.io/last-step-index"]).To(Equal("2"))
+			Expect(rollout.Annotations["internal.rollout.kuberik.io/step-2-started-at"]).NotTo(BeEmpty(), "step-2-started-at should be set")
+			// ready-at should not be set yet (step not ready)
+			_, exists = rollout.Annotations["internal.rollout.kuberik.io/step-2-ready-at"]
+			Expect(exists).To(BeFalse(), "step-2-ready-at should not be set yet")
 		})
 	})
 
