@@ -39,6 +39,23 @@ type RolloutTestSpec struct {
 	JobTemplate batchv1.JobSpec `json:"jobTemplate"`
 }
 
+// RolloutTestPhase represents the current phase of a RolloutTest
+// +kubebuilder:validation:Enum=WaitingForStep;Pending;Running;Succeeded;Failed
+type RolloutTestPhase string
+
+const (
+	// RolloutTestPhaseWaitingForStep indicates the test is waiting for the rollout to reach the target step
+	RolloutTestPhaseWaitingForStep RolloutTestPhase = "WaitingForStep"
+	// RolloutTestPhasePending indicates the job has been created but hasn't started running yet
+	RolloutTestPhasePending RolloutTestPhase = "Pending"
+	// RolloutTestPhaseRunning indicates the job is currently running
+	RolloutTestPhaseRunning RolloutTestPhase = "Running"
+	// RolloutTestPhaseSucceeded indicates the test job completed successfully
+	RolloutTestPhaseSucceeded RolloutTestPhase = "Succeeded"
+	// RolloutTestPhaseFailed indicates the test job failed
+	RolloutTestPhaseFailed RolloutTestPhase = "Failed"
+)
+
 // RolloutTestStatus defines the observed state of RolloutTest.
 type RolloutTestStatus struct {
 	// Conditions store the status conditions of the RolloutTest.
@@ -52,6 +69,30 @@ type RolloutTestStatus struct {
 	// When the canaryRevision changes, it indicates a new rollout and the old job should be deleted.
 	// +optional
 	ObservedCanaryRevision string `json:"observedCanaryRevision,omitempty"`
+
+	// Phase represents the current phase of the RolloutTest
+	// +optional
+	Phase RolloutTestPhase `json:"phase,omitempty"`
+
+	// JobName is the name of the Job created for this test
+	// +optional
+	JobName string `json:"jobName,omitempty"`
+
+	// RetryCount is the number of times the job has been retried (from job status)
+	// +optional
+	RetryCount int32 `json:"retryCount,omitempty"`
+
+	// ActivePods is the number of active pods for the job
+	// +optional
+	ActivePods int32 `json:"activePods,omitempty"`
+
+	// SucceededPods is the number of succeeded pods for the job
+	// +optional
+	SucceededPods int32 `json:"succeededPods,omitempty"`
+
+	// FailedPods is the number of failed pods for the job
+	// +optional
+	FailedPods int32 `json:"failedPods,omitempty"`
 }
 
 // +kubebuilder:object:root=true

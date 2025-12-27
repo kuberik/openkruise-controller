@@ -8900,6 +8900,10 @@ spec:
           status:
             description: status defines the observed state of RolloutTest
             properties:
+              activePods:
+                description: ActivePods is the number of active pods for the job
+                format: int32
+                type: integer
               conditions:
                 description: Conditions store the status conditions of the RolloutTest.
                 items:
@@ -8960,11 +8964,37 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              failedPods:
+                description: FailedPods is the number of failed pods for the job
+                format: int32
+                type: integer
+              jobName:
+                description: JobName is the name of the Job created for this test
+                type: string
               observedCanaryRevision:
                 description: |-
                   ObservedCanaryRevision is the canaryRevision from the Rollout that the current job was created for.
                   When the canaryRevision changes, it indicates a new rollout and the old job should be deleted.
                 type: string
+              phase:
+                description: Phase represents the current phase of the RolloutTest
+                enum:
+                - WaitingForStep
+                - Pending
+                - Running
+                - Succeeded
+                - Failed
+                type: string
+              retryCount:
+                description: RetryCount is the number of times the job has been retried
+                  (from job status)
+                format: int32
+                type: integer
+              succeededPods:
+                description: SucceededPods is the number of succeeded pods for the
+                  job
+                format: int32
+                type: integer
             type: object
         required:
         - spec

@@ -124,6 +124,12 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// Check if canary is in paused state before creating the job
 		if !r.isCanaryPaused(&rollout) {
 			log.Info("Rollout is at target step but canary is not paused, waiting", "step", rolloutTest.Spec.StepIndex)
+			// Set phase to WaitingForStep
+			rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseWaitingForStep
+			rolloutTest.Status.JobName = ""
+			if err := r.Status().Update(ctx, &rolloutTest); err != nil {
+				log.Error(err, "failed to update status")
+			}
 			return ctrl.Result{}, nil
 		}
 		log.Info("Rollout is at target step and canary is paused, creating Job", "step", rolloutTest.Spec.StepIndex)
@@ -135,9 +141,14 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.createJob(ctx, &rolloutTest, currentRevision)
 	}
 
-	// Not at the step yet, or passed it?
-	// If passed, we missed it? Or maybe we should run it anyway?
-	// For now, do nothing.
+	// Not at the step yet - set phase to WaitingForStep
+	if rollout.Status.CurrentStepIndex < rolloutTest.Spec.StepIndex {
+		rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseWaitingForStep
+		rolloutTest.Status.JobName = ""
+		if err := r.Status().Update(ctx, &rolloutTest); err != nil {
+			log.Error(err, "failed to update status")
+		}
+	}
 	return ctrl.Result{}, nil
 }
 
@@ -168,6 +179,13 @@ func (r *RolloutTestReconciler) createJob(ctx context.Context, rolloutTest *roll
 
 	// Update the RolloutTest status to record which canaryRevision this job is for
 	rolloutTest.Status.ObservedCanaryRevision = canaryRevision
+	rolloutTest.Status.JobName = job.Name
+	rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhasePending
+	rolloutTest.Status.RetryCount = 0
+	rolloutTest.Status.ActivePods = 0
+	rolloutTest.Status.SucceededPods = 0
+	rolloutTest.Status.FailedPods = 0
+
 	if err := r.Status().Update(ctx, rolloutTest); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -199,96 +217,105 @@ func (r *RolloutTestReconciler) isJobSucceeded(job *batchv1.Job) bool {
 }
 
 func (r *RolloutTestReconciler) updateStatus(ctx context.Context, rolloutTest *rolloutv1alpha1.RolloutTest, job *batchv1.Job, canaryRevision string) (ctrl.Result, error) {
-	// Check for failure first (higher priority than success)
+	// Update job-related status fields
+	rolloutTest.Status.JobName = job.Name
+	rolloutTest.Status.ActivePods = job.Status.Active
+	rolloutTest.Status.SucceededPods = job.Status.Succeeded
+	rolloutTest.Status.FailedPods = job.Status.Failed
+
+	// Calculate retry count from failed pods (each failed pod typically represents a retry)
+	// For more accurate retry count, we could track this separately, but failed pods is a good approximation
+	rolloutTest.Status.RetryCount = job.Status.Failed
+
+	// Determine phase based on job status
+	var phase rolloutv1alpha1.RolloutTestPhase
+	var readyStatus metav1.ConditionStatus
+	var reason, message string
+
+	// Check if job has started (has start time)
+	hasStarted := job.Status.StartTime != nil
+
 	if r.isJobFailed(job) {
+		phase = rolloutv1alpha1.RolloutTestPhaseFailed
+		readyStatus = metav1.ConditionFalse
+		reason = "JobFailed"
+		message = "Test job failed"
+
 		// Extract failure message from job conditions if available
-		failureMessage := "Test job failed"
-		failureReason := "JobFailed"
 		for _, condition := range job.Status.Conditions {
 			if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
 				if condition.Message != "" {
-					failureMessage = condition.Message
+					message = condition.Message
 				}
 				if condition.Reason != "" {
-					failureReason = condition.Reason
+					reason = condition.Reason
 				}
 				break
 			}
 		}
-
-		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-			Type:               "Ready",
-			Status:             metav1.ConditionFalse,
-			ObservedGeneration: rolloutTest.Generation,
-			Reason:             failureReason,
-			Message:            failureMessage,
-			LastTransitionTime: metav1.Now(),
-		})
-		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-			Type:               "Failed",
-			Status:             metav1.ConditionTrue,
-			ObservedGeneration: rolloutTest.Generation,
-			Reason:             failureReason,
-			Message:            failureMessage,
-			LastTransitionTime: metav1.Now(),
-		})
-		// Set Stalled condition to True for kstatus compatibility (maps to FailedStatus)
-		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-			Type:               "Stalled",
-			Status:             metav1.ConditionTrue,
-			ObservedGeneration: rolloutTest.Generation,
-			Reason:             failureReason,
-			Message:            failureMessage,
-			LastTransitionTime: metav1.Now(),
-		})
 	} else if r.isJobSucceeded(job) {
-		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-			Type:               "Ready",
-			Status:             metav1.ConditionTrue,
-			ObservedGeneration: rolloutTest.Generation,
-			Reason:             "JobSucceeded",
-			Message:            "Test job completed successfully",
-			LastTransitionTime: metav1.Now(),
-		})
+		phase = rolloutv1alpha1.RolloutTestPhaseSucceeded
+		readyStatus = metav1.ConditionTrue
+		reason = "JobSucceeded"
+		message = "Test job completed successfully"
+	} else if hasStarted {
+		// Job has started but not completed - it's running
+		phase = rolloutv1alpha1.RolloutTestPhaseRunning
+		readyStatus = metav1.ConditionFalse
+		reason = "JobInProgress"
+		message = "Test job is running"
+	} else {
+		// Job exists but hasn't started yet - it's pending
+		phase = rolloutv1alpha1.RolloutTestPhasePending
+		readyStatus = metav1.ConditionFalse
+		reason = "JobPending"
+		message = "Test job is pending"
+	}
+
+	rolloutTest.Status.Phase = phase
+
+	// Update conditions
+	meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             readyStatus,
+		ObservedGeneration: rolloutTest.Generation,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: metav1.Now(),
+	})
+
+	if phase == rolloutv1alpha1.RolloutTestPhaseFailed {
 		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
 			Type:               "Failed",
-			Status:             metav1.ConditionFalse,
+			Status:             metav1.ConditionTrue,
 			ObservedGeneration: rolloutTest.Generation,
-			Reason:             "JobSucceeded",
-			Message:            "Test job completed successfully",
+			Reason:             reason,
+			Message:            message,
 			LastTransitionTime: metav1.Now(),
 		})
 		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
 			Type:               "Stalled",
-			Status:             metav1.ConditionFalse,
+			Status:             metav1.ConditionTrue,
 			ObservedGeneration: rolloutTest.Generation,
-			Reason:             "JobSucceeded",
-			Message:            "Test job completed successfully",
+			Reason:             reason,
+			Message:            message,
 			LastTransitionTime: metav1.Now(),
 		})
 	} else {
 		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-			Type:               "Ready",
-			Status:             metav1.ConditionFalse,
-			ObservedGeneration: rolloutTest.Generation,
-			Reason:             "JobInProgress",
-			Message:            "Test job is running",
-			LastTransitionTime: metav1.Now(),
-		})
-		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
 			Type:               "Failed",
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: rolloutTest.Generation,
-			Reason:             "JobInProgress",
-			Message:            "Test job is running",
+			Reason:             reason,
+			Message:            message,
 			LastTransitionTime: metav1.Now(),
 		})
 		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
 			Type:               "Stalled",
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: rolloutTest.Generation,
-			Reason:             "JobInProgress",
-			Message:            "Test job is running",
+			Reason:             reason,
+			Message:            message,
 			LastTransitionTime: metav1.Now(),
 		})
 	}
