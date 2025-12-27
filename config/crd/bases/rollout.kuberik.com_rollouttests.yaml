@@ -8984,6 +8984,7 @@ spec:
                 - Running
                 - Succeeded
                 - Failed
+                - Cancelled
                 type: string
               retryCount:
                 description: RetryCount is the number of times the job has been retried

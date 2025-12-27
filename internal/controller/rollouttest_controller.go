@@ -87,10 +87,69 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	// If Job exists, check if the canary revision has changed
+	// If Job exists, check if the canary revision has changed or step has moved forward
 	if job != nil {
 		// Check the job's revision label
 		jobRevision := job.Labels["rollout.kuberik.io/canary-revision"]
+
+		// Check if rollout has moved to a different step (manually approved)
+		// If CurrentStepIndex is no longer at the RolloutTest's StepIndex, cancel the job
+		if rollout.Status.CurrentStepIndex != rolloutTest.Spec.StepIndex {
+			log.Info("Rollout step changed, cancelling job",
+				"currentStep", rollout.Status.CurrentStepIndex,
+				"testStep", rolloutTest.Spec.StepIndex)
+			if err := r.Delete(ctx, job); err != nil && !errors.IsNotFound(err) {
+				log.Error(err, "failed to delete job")
+				return ctrl.Result{}, err
+			}
+			// Only update status if test was still running or pending
+			// If test already succeeded or failed, preserve that status until new canary revision
+			if rolloutTest.Status.Phase == rolloutv1alpha1.RolloutTestPhaseRunning ||
+				rolloutTest.Status.Phase == rolloutv1alpha1.RolloutTestPhasePending {
+				// Reset status fields and set phase to Cancelled
+				rolloutTest.Status.JobName = ""
+				rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseCancelled
+				rolloutTest.Status.RetryCount = 0
+				rolloutTest.Status.ActivePods = 0
+				rolloutTest.Status.SucceededPods = 0
+				rolloutTest.Status.FailedPods = 0
+
+				// Update conditions to reflect cancellation
+				// Ready is True because cancellation is a final state - nothing more to do
+				meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+					Type:               "Ready",
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: rolloutTest.Generation,
+					Reason:             "JobCancelled",
+					Message:            "Test job was cancelled because rollout step moved forward",
+					LastTransitionTime: metav1.Now(),
+				})
+				meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+					Type:               "Failed",
+					Status:             metav1.ConditionFalse,
+					ObservedGeneration: rolloutTest.Generation,
+					Reason:             "JobCancelled",
+					Message:            "Test job was cancelled because rollout step moved forward",
+					LastTransitionTime: metav1.Now(),
+				})
+				meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+					Type:               "Stalled",
+					Status:             metav1.ConditionFalse,
+					ObservedGeneration: rolloutTest.Generation,
+					Reason:             "JobCancelled",
+					Message:            "Test job was cancelled because rollout step moved forward",
+					LastTransitionTime: metav1.Now(),
+				})
+
+				if err := r.Status().Update(ctx, &rolloutTest); err != nil {
+					log.Error(err, "failed to update status after job cancellation")
+					return ctrl.Result{}, err
+				}
+			}
+			// If test already succeeded or failed, leave status unchanged
+			// It will be reset when new canary revision is observed
+			return ctrl.Result{}, nil
+		}
 
 		// If the rollout's canaryRevision is different from what the job is labeled with, the rollout has changed
 		// Delete the old job so a new one can be created for the new rollout
@@ -103,6 +162,18 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				"newRevision", rollout.Status.CanaryStatus.CanaryRevision)
 			if err := r.Delete(ctx, job); err != nil && !errors.IsNotFound(err) {
 				log.Error(err, "failed to delete old job")
+				return ctrl.Result{}, err
+			}
+			// Reset status fields when new canary is observed
+			rolloutTest.Status.JobName = ""
+			rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseWaitingForStep
+			rolloutTest.Status.RetryCount = 0
+			rolloutTest.Status.ActivePods = 0
+			rolloutTest.Status.SucceededPods = 0
+			rolloutTest.Status.FailedPods = 0
+			rolloutTest.Status.ObservedCanaryRevision = ""
+			if err := r.Status().Update(ctx, &rolloutTest); err != nil {
+				log.Error(err, "failed to update status after canary change")
 				return ctrl.Result{}, err
 			}
 			// Job deleted, will be recreated when rollout reaches target step
