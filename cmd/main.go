@@ -35,8 +35,11 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
+	sourcev1 "github.com/fluxcd/source-controller/api/v1"
 	rolloutv1alpha1 "github.com/kuberik/openkruise-controller/api/v1alpha1"
 	"github.com/kuberik/openkruise-controller/internal/controller"
+	kuberikrolloutv1alpha1 "github.com/kuberik/rollout-controller/api/v1alpha1"
 	kruiserolloutv1beta1 "github.com/openkruise/kruise-rollout-api/rollouts/v1beta1"
 	// +kubebuilder:scaffold:imports
 )
@@ -51,6 +54,9 @@ func init() {
 
 	utilruntime.Must(rolloutv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(kruiserolloutv1beta1.AddToScheme(scheme))
+	utilruntime.Must(kustomizev1.AddToScheme(scheme))
+	utilruntime.Must(sourcev1.AddToScheme(scheme))
+	utilruntime.Must(kuberikrolloutv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
