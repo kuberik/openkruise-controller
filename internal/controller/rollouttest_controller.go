@@ -92,12 +92,20 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// Check the job's revision label
 		jobRevision := job.Labels["rollout.kuberik.io/canary-revision"]
 
-		// Check if rollout has moved to a different step (manually approved)
-		// If CurrentStepIndex is no longer at the RolloutTest's StepIndex, cancel the job
-		if rollout.Status.CurrentStepIndex != rolloutTest.Spec.StepIndex {
-			log.Info("Rollout step changed, cancelling job",
-				"currentStep", rollout.Status.CurrentStepIndex,
-				"testStep", rolloutTest.Spec.StepIndex)
+		// Check if rollout has moved to a different step (manually approved) or is stalled
+		// If CurrentStepIndex is no longer at the RolloutTest's StepIndex, or Rollout is Stalled, cancel the job
+		isStalled := r.isRolloutStalled(&rollout)
+		if rollout.Status.CurrentStepIndex != rolloutTest.Spec.StepIndex || isStalled {
+			cancellationMessage := "Test job was cancelled because rollout step moved forward"
+			if isStalled {
+				log.Info("Rollout is stalled, cancelling job")
+				cancellationMessage = "Test job was cancelled because rollout is stalled"
+			} else {
+				log.Info("Rollout step changed, cancelling job",
+					"currentStep", rollout.Status.CurrentStepIndex,
+					"testStep", rolloutTest.Spec.StepIndex)
+			}
+
 			if err := r.Delete(ctx, job); err != nil && !errors.IsNotFound(err) {
 				log.Error(err, "failed to delete job")
 				return ctrl.Result{}, err
@@ -121,7 +129,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					Status:             metav1.ConditionTrue,
 					ObservedGeneration: rolloutTest.Generation,
 					Reason:             "JobCancelled",
-					Message:            "Test job was cancelled because rollout step moved forward",
+					Message:            cancellationMessage,
 					LastTransitionTime: metav1.Now(),
 				})
 				meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
@@ -129,7 +137,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					Status:             metav1.ConditionFalse,
 					ObservedGeneration: rolloutTest.Generation,
 					Reason:             "JobCancelled",
-					Message:            "Test job was cancelled because rollout step moved forward",
+					Message:            cancellationMessage,
 					LastTransitionTime: metav1.Now(),
 				})
 				meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
@@ -137,7 +145,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					Status:             metav1.ConditionFalse,
 					ObservedGeneration: rolloutTest.Generation,
 					Reason:             "JobCancelled",
-					Message:            "Test job was cancelled because rollout step moved forward",
+					Message:            cancellationMessage,
 					LastTransitionTime: metav1.Now(),
 				})
 
@@ -192,6 +200,46 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// If Job does not exist, check if we should create one
 	// We trigger if CurrentStepIndex matches StepIndex AND canary is paused
 	if rollout.Status.CurrentStepIndex == rolloutTest.Spec.StepIndex {
+		// Check if rollout is stalled
+		if r.isRolloutStalled(&rollout) {
+			log.Info("Rollout is stalled, not creating Job", "step", rolloutTest.Spec.StepIndex)
+			if rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseCancelled {
+				rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseCancelled
+				rolloutTest.Status.JobName = ""
+
+				message := "Test job creation skipped because rollout is stalled"
+				meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+					Type:               "Ready",
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: rolloutTest.Generation,
+					Reason:             "JobCancelled",
+					Message:            message,
+					LastTransitionTime: metav1.Now(),
+				})
+				meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+					Type:               "Failed",
+					Status:             metav1.ConditionFalse,
+					ObservedGeneration: rolloutTest.Generation,
+					Reason:             "JobCancelled",
+					Message:            message,
+					LastTransitionTime: metav1.Now(),
+				})
+				meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+					Type:               "Stalled",
+					Status:             metav1.ConditionFalse,
+					ObservedGeneration: rolloutTest.Generation,
+					Reason:             "JobCancelled",
+					Message:            message,
+					LastTransitionTime: metav1.Now(),
+				})
+
+				if err := r.Status().Update(ctx, &rolloutTest); err != nil {
+					log.Error(err, "failed to update status")
+					return ctrl.Result{}, err
+				}
+			}
+			return ctrl.Result{}, nil
+		}
 		// Check if canary is in paused state before creating the job
 		if !r.isCanaryPaused(&rollout) {
 			log.Info("Rollout is at target step but canary is not paused, waiting", "step", rolloutTest.Spec.StepIndex)
@@ -413,6 +461,19 @@ func (r *RolloutTestReconciler) isCanaryPaused(rollout *kruiserolloutv1beta1.Rol
 	// Common values: "StepPaused", "Paused", etc.
 	state := rollout.Status.CanaryStatus.CurrentStepState
 	return state == "StepPaused" || state == "Paused"
+}
+
+// isRolloutStalled checks if the rollout is in a stalled state
+func (r *RolloutTestReconciler) isRolloutStalled(rollout *kruiserolloutv1beta1.Rollout) bool {
+	if rollout.Status.Conditions == nil {
+		return false
+	}
+	for _, condition := range rollout.Status.Conditions {
+		if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // SetupWithManager sets up the controller with the Manager.

@@ -24,7 +24,7 @@ import (
 )
 
 var _ = Describe("RolloutStepGate Controller", func() {
-	Context("When max wait is exceeded", func() {
+	Context("When step-ready-timeout is exceeded", func() {
 		var namespace string
 		var rollout *kruiserolloutv1beta1.Rollout
 		var rolloutTest *rolloutv1alpha1.RolloutTest
@@ -41,14 +41,14 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			Expect(k8sClient.Create(ctx, ns)).To(Succeed())
 			namespace = ns.Name
 
-			By("creating the Rollout with max-wait annotation")
+			By("creating the Rollout with ready-timeout annotation")
 			rollout = &kruiserolloutv1beta1.Rollout{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-rollout",
 					Namespace: namespace,
 					Annotations: map[string]string{
-						"rollout.kuberik.io/step-1-max-wait": "1m",
-						"rollout.kuberik.io/step-2-max-wait": "1m",
+						"rollout.kuberik.io/step-1-ready-timeout": "1m",
+						"rollout.kuberik.io/step-2-ready-timeout": "1m",
 					},
 				},
 				Spec: kruiserolloutv1beta1.RolloutSpec{
@@ -108,7 +108,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			Expect(k8sClient.Delete(ctx, ns)).To(Succeed())
 		})
 
-		It("should set Stalled condition when max wait is exceeded before step becomes ready", func() {
+		It("should set Stalled condition when step-ready-timeout is exceeded before step becomes ready", func() {
 			ctx := context.Background()
 			controllerReconciler := &RolloutStepGateReconciler{
 				Client: k8sClient,
@@ -130,9 +130,9 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			rolloutTest.Status.ObservedCanaryRevision = "v1"
 			// No conditions set, so test is not passed yet
 
-			By("Setting started-at annotation to a time in the past (exceeding max-wait)")
+			By("Setting started-at annotation to a time in the past (exceeding ready-timeout)")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
-			pastTime := time.Now().Add(-2 * time.Minute) // 2 minutes ago, max-wait is 1 minute
+			pastTime := time.Now().Add(-2 * time.Minute) // 2 minutes ago, ready-timeout is 1 minute
 			if rollout.Annotations == nil {
 				rollout.Annotations = make(map[string]string)
 			}
@@ -164,8 +164,8 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 			Expect(stalledCondition).NotTo(BeNil(), "Stalled condition should be set after timeout")
 			Expect(stalledCondition.Status).To(Equal(corev1.ConditionTrue))
-			Expect(stalledCondition.Reason).To(Equal("MaxWaitExceeded"))
-			Expect(stalledCondition.Message).To(ContainSubstring("max-wait"))
+			Expect(stalledCondition.Reason).To(Equal("StepReadyTimeoutExceeded"))
+			Expect(stalledCondition.Message).To(ContainSubstring("ready-timeout"))
 
 			By("Verifying kstatus recognizes it as Failed")
 			uMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(rollout)
@@ -377,7 +377,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 				{
 					Type:               kruiserolloutv1beta1.RolloutConditionType("Stalled"),
 					Status:             corev1.ConditionTrue,
-					Reason:             "MaxWaitExceeded",
+					Reason:             "StepReadyTimeoutExceeded",
 					Message:            "Test message",
 					LastTransitionTime: metav1.Now(),
 					LastUpdateTime:     metav1.Now(),
@@ -399,9 +399,9 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 			Expect(k8sClient.Status().Update(ctx, rolloutTest)).To(Succeed())
 
-			By("Setting started-at annotation to a recent time (within max-wait) and step is ready")
+			By("Setting started-at annotation to a recent time (within ready-timeout) and step is ready")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
-			// Set started-at to 10 seconds ago, so deadline is 50 seconds from now (well within max-wait of 1 minute)
+			// Set started-at to 10 seconds ago, so deadline is 50 seconds from now (well within ready-timeout of 1 minute)
 			recentTime := time.Now().Add(-10 * time.Second)
 			if rollout.Annotations == nil {
 				rollout.Annotations = make(map[string]string)
@@ -469,8 +469,8 @@ var _ = Describe("RolloutStepGate Controller", func() {
 				{
 					Type:               kruiserolloutv1beta1.RolloutConditionType("Stalled"),
 					Status:             corev1.ConditionTrue,
-					Reason:             "MaxWaitExceeded",
-					Message:            "Step 1 max-wait (1m0s) exceeded at 2024-01-01T00:00:00Z for canary v1. Rollout is paused and requires manual intervention.",
+					Reason:             "StepReadyTimeoutExceeded",
+					Message:            "Step 1 ready-timeout (1m0s) exceeded at 2024-01-01T00:00:00Z for canary v1. Rollout is paused and requires manual intervention.",
 					LastTransitionTime: metav1.Now(),
 					LastUpdateTime:     metav1.Now(),
 				},
@@ -552,8 +552,8 @@ var _ = Describe("RolloutStepGate Controller", func() {
 				{
 					Type:               kruiserolloutv1beta1.RolloutConditionType("Stalled"),
 					Status:             corev1.ConditionTrue,
-					Reason:             "MaxWaitExceeded",
-					Message:            "Step 1 max-wait (1m0s) exceeded at 2024-01-01T00:00:00Z for canary v1. Rollout is paused and requires manual intervention.",
+					Reason:             "StepReadyTimeoutExceeded",
+					Message:            "Step 1 ready-timeout (1m0s) exceeded at 2024-01-01T00:00:00Z for canary v1. Rollout is paused and requires manual intervention.",
 					LastTransitionTime: metav1.Now(),
 					LastUpdateTime:     metav1.Now(),
 				},
@@ -672,7 +672,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			if rollout.Annotations == nil {
 				rollout.Annotations = make(map[string]string)
 			}
-			rollout.Annotations["rollout.kuberik.io/step-2-max-wait"] = "1m"
+			rollout.Annotations["rollout.kuberik.io/step-2-ready-timeout"] = "1m"
 			Expect(k8sClient.Update(ctx, rollout)).To(Succeed())
 
 			// Update status separately - ensure CanaryStatus is initialized
@@ -1112,6 +1112,83 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			Expect(stalledCondition).NotTo(BeNil())
 			Expect(stalledCondition.Status).To(Equal(corev1.ConditionTrue))
 			Expect(stalledCondition.Reason).To(Equal("KuberikRolloutBakeFailed"))
+		})
+
+		It("should discover kustomize via labels and set Stalled condition on bake failure", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Setting up bake failure on kuberik Rollout")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kuberik-rollout", Namespace: namespace}, kuberikRollout)).To(Succeed())
+			failedBakeStatus := kuberikrolloutv1alpha1.BakeStatusFailed
+			kuberikRollout.Status.History[0].BakeStatus = &failedBakeStatus
+			Expect(k8sClient.Status().Update(ctx, kuberikRollout)).To(Succeed())
+
+			By("Removing kustomize annotations from OpenKruise Rollout and adding labels")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kruise-rollout", Namespace: namespace}, kruiseRollout)).To(Succeed())
+			delete(kruiseRollout.Annotations, "kustomize.toolkit.fluxcd.io/name")
+			delete(kruiseRollout.Annotations, "kustomize.toolkit.fluxcd.io/namespace")
+			if kruiseRollout.Labels == nil {
+				kruiseRollout.Labels = make(map[string]string)
+			}
+			kruiseRollout.Labels["kustomize.toolkit.fluxcd.io/name"] = "test-kustomization"
+			kruiseRollout.Labels["kustomize.toolkit.fluxcd.io/namespace"] = namespace
+			Expect(k8sClient.Update(ctx, kruiseRollout)).To(Succeed())
+
+			By("Reconciling - should discover via labels and set Stalled condition")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-kruise-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying Stalled condition is set")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kruise-rollout", Namespace: namespace}, kruiseRollout)).To(Succeed())
+
+			var stalledCondition *kruiserolloutv1beta1.RolloutCondition
+			if kruiseRollout.Status.Conditions != nil {
+				for i := range kruiseRollout.Status.Conditions {
+					if kruiseRollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
+						stalledCondition = &kruiseRollout.Status.Conditions[i]
+						break
+					}
+				}
+			}
+			Expect(stalledCondition).NotTo(BeNil(), "Stalled condition should be set when discovered via labels")
+			Expect(stalledCondition.Reason).To(Equal("KuberikRolloutBakeFailed"))
+		})
+
+		It("should block auto-approval with ready-timeout on bake failure", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Setting up bake failure on kuberik Rollout")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kuberik-rollout", Namespace: namespace}, kuberikRollout)).To(Succeed())
+			failedBakeStatus := kuberikrolloutv1alpha1.BakeStatusFailed
+			kuberikRollout.Status.History[0].BakeStatus = &failedBakeStatus
+			Expect(k8sClient.Status().Update(ctx, kuberikRollout)).To(Succeed())
+
+			By("Reconciling - should detect failed bake status even with ready-timeout and stay paused")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-kruise-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying rollout remains paused")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kruise-rollout", Namespace: namespace}, kruiseRollout)).To(Succeed())
+			Expect(kruiseRollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).NotTo(BeNil())
+			Expect(*kruiseRollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).To(Equal(int32(3600)))
 		})
 	})
 })

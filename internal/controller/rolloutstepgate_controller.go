@@ -42,8 +42,8 @@ import (
 
 const (
 	// Annotation keys for step configuration (user-set)
-	annotationStepMaxWaitPrefix             = "rollout.kuberik.io/step-%d-max-wait"
-	annotationStepMinWaitAfterSuccessPrefix = "rollout.kuberik.io/step-%d-min-wait-after-success"
+	annotationStepReadyTimeoutPrefix = "rollout.kuberik.io/step-%d-ready-timeout"
+	annotationStepBakeTimePrefix     = "rollout.kuberik.io/step-%d-bake-time"
 
 	// Internal annotation keys (controller-managed)
 	// Store when the step started (when we first entered this step)
@@ -102,7 +102,8 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	// Check if rollout was deployed by kustomize and if kuberik rollout has failed bake status
-	if err := r.checkKuberikRolloutBakeStatus(ctx, &rollout); err != nil {
+	bakeFailed, err := r.checkKuberikRolloutBakeStatus(ctx, &rollout)
+	if err != nil {
 		log.Error(err, "failed to check kuberik rollout bake status")
 		// Non-fatal, continue with normal flow
 	}
@@ -210,37 +211,22 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	// Check if this step has auto-approval configuration
-	maxWaitStr := r.getStepAnnotation(&rollout, currentStepIndex, annotationStepMaxWaitPrefix)
-	if maxWaitStr == "" {
-		// No auto-approval config for this step, nothing to do
-		return ctrl.Result{}, nil
-	}
-
-	maxWait, err := time.ParseDuration(maxWaitStr)
+	readyTimeoutStr := r.getStepAnnotation(&rollout, currentStepIndex, annotationStepReadyTimeoutPrefix)
+	readyTimeout, err := time.ParseDuration(readyTimeoutStr)
 	if err != nil {
-		log.Error(err, "invalid max-wait duration", "step", currentStepIndex, "value", maxWaitStr)
+		log.Error(err, "invalid step-ready-timeout duration", "step", currentStepIndex, "value", readyTimeoutStr)
 		return ctrl.Result{}, nil
 	}
 
-	// Get min-wait-after-success if configured
-	minWaitAfterSuccessStr := r.getStepAnnotation(&rollout, currentStepIndex, annotationStepMinWaitAfterSuccessPrefix)
-	var minWaitAfterSuccess time.Duration
-	if minWaitAfterSuccessStr != "" {
-		minWaitAfterSuccess, err = time.ParseDuration(minWaitAfterSuccessStr)
+	// Get step-bake-time if configured
+	bakeTimeStr := r.getStepAnnotation(&rollout, currentStepIndex, annotationStepBakeTimePrefix)
+	var bakeTime time.Duration
+	if bakeTimeStr != "" {
+		bakeTime, err = time.ParseDuration(bakeTimeStr)
 		if err != nil {
-			log.Error(err, "invalid min-wait-after-success duration", "step", currentStepIndex, "value", minWaitAfterSuccessStr)
+			log.Error(err, "invalid step-bake-time duration", "step", currentStepIndex, "value", bakeTimeStr)
 			return ctrl.Result{}, nil
 		}
-	}
-
-	// Ensure the step is paused
-	if err := r.ensureStepPaused(ctx, &rollout, currentStepIndex); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// Refetch rollout after ensureStepPaused (which may have updated the rollout)
-	if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
-		return ctrl.Result{}, err
 	}
 
 	// Check if step is actually paused (in StepPaused state)
@@ -261,13 +247,18 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	// Evaluate test status
-	allPassed, anyFailed := r.evaluateTests(relevantTests)
+	allPassed, anyFailedTests := r.evaluateTests(relevantTests)
+	anyFailed := anyFailedTests || bakeFailed
 
 	now := time.Now()
 
 	// Check for failure conditions first
 	if anyFailed {
-		log.Info("Tests failed for step, keeping paused", "step", currentStepIndex)
+		if bakeFailed {
+			log.Info("Kuberik rollout bake failed, keeping paused", "step", currentStepIndex)
+		} else {
+			log.Info("Tests failed for step, keeping paused", "step", currentStepIndex)
+		}
 		// Keep paused - user needs to intervene
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
@@ -297,7 +288,7 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	// Calculate deadline from when step started
-	deadline := startedAt.Add(maxWait)
+	deadline := startedAt.Add(readyTimeout)
 
 	// Determine when the step became ready for approval
 	// Ready = step paused AND all tests passed (whichever happens later)
@@ -357,13 +348,13 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		// Check for timeout only if step is NOT ready yet
 		if now.After(deadline) {
-			log.Info("Step max-wait exceeded before becoming ready, keeping paused", "step", currentStepIndex, "deadline", deadline, "now", now)
+			log.Info("Step ready-timeout exceeded before becoming ready, keeping paused", "step", currentStepIndex, "deadline", deadline, "now", now)
 			// Refetch rollout to ensure we have latest resource version before status update
 			if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
 				return ctrl.Result{}, err
 			}
 			// Set Stalled condition for kstatus compatibility (maps to FailedStatus)
-			if err := r.setStalledCondition(ctx, &rollout, currentStepIndex, deadline, maxWait); err != nil {
+			if err := r.setStalledCondition(ctx, &rollout, currentStepIndex, deadline, readyTimeout); err != nil {
 				log.Error(err, "failed to set Stalled condition")
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 			}
@@ -381,19 +372,19 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// Step is ready - no timeout check needed, just wait for min-wait and auto-approve
+	// Step is ready - no timeout check needed, just wait for bake-time and auto-approve
 	// Clear Stalled condition if it exists (step became ready, so no timeout)
 	if err := r.clearStalledCondition(ctx, &rollout); err != nil {
 		log.Error(err, "failed to clear Stalled condition")
 		// Non-fatal, continue
 	}
 
-	// Check if min-wait-after-success has elapsed since step became ready
-	if minWaitAfterSuccess > 0 {
+	// Check if step-bake-time has elapsed since step became ready
+	if bakeTime > 0 {
 		timeSinceReady := now.Sub(readyAt)
-		if timeSinceReady < minWaitAfterSuccess {
-			remaining := minWaitAfterSuccess - timeSinceReady
-			log.Info("Step ready, waiting for min-wait-after-success",
+		if timeSinceReady < bakeTime {
+			remaining := bakeTime - timeSinceReady
+			log.Info("Step ready, waiting for step-bake-time",
 				"step", currentStepIndex,
 				"timeSinceReady", timeSinceReady,
 				"remaining", remaining)
@@ -508,32 +499,6 @@ func (r *RolloutStepGateReconciler) cleanupStepAnnotationsForOtherSteps(ctx cont
 	return nil
 }
 
-// ensureStepPaused ensures the rollout step is paused
-func (r *RolloutStepGateReconciler) ensureStepPaused(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout, stepIndex int32) error {
-	if rollout.Spec.Strategy.Canary == nil {
-		return nil
-	}
-
-	steps := rollout.Spec.Strategy.Canary.Steps
-	if int(stepIndex) > len(steps) {
-		return nil
-	}
-
-	stepIdx := int(stepIndex) - 1 // Convert to 0-based index
-	step := &steps[stepIdx]
-
-	// Check if step already has a long pause duration
-	if step.Pause.Duration != nil && *step.Pause.Duration >= maxPauseDuration {
-		return nil
-	}
-
-	// Set pause duration to max value
-	duration := maxPauseDuration
-	step.Pause.Duration = &duration
-
-	return r.Update(ctx, rollout)
-}
-
 // unpauseStep removes the pause from the step
 func (r *RolloutStepGateReconciler) unpauseStep(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout, stepIndex int32) error {
 	if rollout.Spec.Strategy.Canary == nil {
@@ -623,8 +588,8 @@ func (r *RolloutStepGateReconciler) evaluateTests(tests []rolloutv1alpha1.Rollou
 	return false, false
 }
 
-// setStalledCondition sets the Stalled condition on the Rollout when max wait is exceeded
-func (r *RolloutStepGateReconciler) setStalledCondition(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout, stepIndex int32, deadline time.Time, maxWait time.Duration) error {
+// setStalledCondition sets the Stalled condition on the Rollout when step-ready-timeout is exceeded
+func (r *RolloutStepGateReconciler) setStalledCondition(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout, stepIndex int32, deadline time.Time, readyTimeout time.Duration) error {
 	// Check if condition already exists and is up to date
 	if rollout.Status.Conditions != nil {
 		for _, condition := range rollout.Status.Conditions {
@@ -641,7 +606,7 @@ func (r *RolloutStepGateReconciler) setStalledCondition(ctx context.Context, rol
 	}
 
 	currentRevision := rollout.Status.CanaryStatus.CanaryRevision
-	message := fmt.Sprintf("Step %d max-wait (%v) exceeded at %v for canary %s. Rollout is paused and requires manual intervention.", stepIndex, maxWait, deadline.Format(time.RFC3339), currentRevision)
+	message := fmt.Sprintf("Step %d step-ready-timeout (%v) exceeded at %v for canary %s. Rollout is paused and requires manual intervention.", stepIndex, readyTimeout, deadline.Format(time.RFC3339), currentRevision)
 	now := metav1.Now()
 
 	// Find and update existing condition or add new one
@@ -649,7 +614,7 @@ func (r *RolloutStepGateReconciler) setStalledCondition(ctx context.Context, rol
 	for i := range rollout.Status.Conditions {
 		if rollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
 			rollout.Status.Conditions[i].Status = corev1.ConditionTrue
-			rollout.Status.Conditions[i].Reason = "MaxWaitExceeded"
+			rollout.Status.Conditions[i].Reason = "StepReadyTimeoutExceeded"
 			rollout.Status.Conditions[i].Message = message
 			rollout.Status.Conditions[i].LastTransitionTime = now
 			rollout.Status.Conditions[i].LastUpdateTime = now
@@ -662,7 +627,7 @@ func (r *RolloutStepGateReconciler) setStalledCondition(ctx context.Context, rol
 		rollout.Status.Conditions = append(rollout.Status.Conditions, kruiserolloutv1beta1.RolloutCondition{
 			Type:               kruiserolloutv1beta1.RolloutConditionType("Stalled"),
 			Status:             corev1.ConditionTrue,
-			Reason:             "MaxWaitExceeded",
+			Reason:             "StepReadyTimeoutExceeded",
 			Message:            message,
 			LastTransitionTime: now,
 			LastUpdateTime:     now,
@@ -683,7 +648,7 @@ func (r *RolloutStepGateReconciler) clearStalledConditionIfNewCanary(ctx context
 	for _, condition := range rollout.Status.Conditions {
 		if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") && condition.Status == corev1.ConditionTrue {
 			// Extract canary revision from message
-			// Message format: "Step X max-wait (...) exceeded at ... for canary REVISION. ..."
+			// Message format: "Step X step-ready-timeout (...) exceeded at ... for canary REVISION. ..."
 			stalledRevision := r.extractCanaryRevisionFromMessage(condition.Message)
 			if stalledRevision != "" && stalledRevision != currentRevision {
 				// Stalled condition is for a different canary, clear it
@@ -701,7 +666,7 @@ func (r *RolloutStepGateReconciler) clearStalledConditionIfNewCanary(ctx context
 }
 
 // extractCanaryRevisionFromMessage extracts the canary revision from the Stalled condition message
-// Message format: "Step X max-wait (...) exceeded at ... for canary REVISION. ..."
+// Message format: "Step X step-ready-timeout (...) exceeded at ... for canary REVISION. ..."
 func (r *RolloutStepGateReconciler) extractCanaryRevisionFromMessage(message string) string {
 	// Look for "for canary " followed by the revision
 	prefix := "for canary "
@@ -764,7 +729,7 @@ func (r *RolloutStepGateReconciler) clearStalledCondition(ctx context.Context, r
 			rollout.Status.Conditions[i].Reason != "KuberikRolloutBakeFailed" {
 			rollout.Status.Conditions[i].Status = corev1.ConditionFalse
 			rollout.Status.Conditions[i].Reason = "WithinDeadline"
-			rollout.Status.Conditions[i].Message = "Step is within max-wait deadline"
+			rollout.Status.Conditions[i].Message = "Step is within step-ready-timeout deadline"
 			rollout.Status.Conditions[i].LastTransitionTime = now
 			rollout.Status.Conditions[i].LastUpdateTime = now
 			break
@@ -777,15 +742,23 @@ func (r *RolloutStepGateReconciler) clearStalledCondition(ctx context.Context, r
 // checkKuberikRolloutBakeStatus checks if the rollout was deployed by kustomize and if the
 // associated kuberik Rollout has a failed bake status in its latest history entry.
 // If so, sets the Stalled condition.
-func (r *RolloutStepGateReconciler) checkKuberikRolloutBakeStatus(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) error {
+// Returns (bakeFailed, error)
+func (r *RolloutStepGateReconciler) checkKuberikRolloutBakeStatus(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) (bool, error) {
 	log := logf.FromContext(ctx)
 
-	// Check if rollout has kustomize annotations
+	// Check if rollout has kustomize labels or annotations
 	kustomizeName := rollout.Annotations["kustomize.toolkit.fluxcd.io/name"]
+	if kustomizeName == "" {
+		kustomizeName = rollout.Labels["kustomize.toolkit.fluxcd.io/name"]
+	}
 	kustomizeNamespace := rollout.Annotations["kustomize.toolkit.fluxcd.io/namespace"]
+	if kustomizeNamespace == "" {
+		kustomizeNamespace = rollout.Labels["kustomize.toolkit.fluxcd.io/namespace"]
+	}
+
 	if kustomizeName == "" || kustomizeNamespace == "" {
 		// Not deployed by kustomize, skip
-		return nil
+		return false, nil
 	}
 
 	// Get the Kustomization resource
@@ -796,26 +769,24 @@ func (r *RolloutStepGateReconciler) checkKuberikRolloutBakeStatus(ctx context.Co
 	}, &kustomization); err != nil {
 		if client.IgnoreNotFound(err) == nil {
 			// Kustomization not found, skip
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("failed to get Kustomization %s/%s: %w", kustomizeNamespace, kustomizeName, err)
+		return false, fmt.Errorf("failed to get Kustomization %s/%s: %w", kustomizeNamespace, kustomizeName, err)
 	}
 
 	// Find the kuberik Rollout that references this Kustomization
-	// We'll look for Rollouts that have annotations referencing this Kustomization
-	// or check the OCIRepository that the Kustomization references
 	kuberikRollout, err := r.findKuberikRolloutForKustomization(ctx, &kustomization)
 	if err != nil {
-		return fmt.Errorf("failed to find kuberik Rollout for Kustomization: %w", err)
+		return false, fmt.Errorf("failed to find kuberik Rollout for Kustomization: %w", err)
 	}
 	if kuberikRollout == nil {
 		// No kuberik Rollout found, skip
-		return nil
+		return false, nil
 	}
 
 	// Check if the latest history entry has failed bake status
 	if len(kuberikRollout.Status.History) == 0 {
-		return nil
+		return false, nil
 	}
 
 	latestEntry := kuberikRollout.Status.History[0]
@@ -834,9 +805,9 @@ func (r *RolloutStepGateReconciler) checkKuberikRolloutBakeStatus(ctx context.Co
 		}
 		err := r.setStalledConditionForKuberikBakeFailure(ctx, rollout, message)
 		if err != nil {
-			return err
+			return true, err
 		}
-		return nil
+		return true, nil
 	}
 
 	// If bake status is not failed, clear any existing Stalled condition with KuberikRolloutBakeFailed reason
@@ -846,12 +817,13 @@ func (r *RolloutStepGateReconciler) checkKuberikRolloutBakeStatus(ctx context.Co
 				condition.Status == corev1.ConditionTrue &&
 				condition.Reason == "KuberikRolloutBakeFailed" {
 				// Clear the condition
-				return r.clearStalledCondition(ctx, rollout)
+				err := r.clearStalledCondition(ctx, rollout)
+				return false, err
 			}
 		}
 	}
 
-	return nil
+	return false, nil
 }
 
 // findKuberikRolloutForKustomization finds the kuberik Rollout that references the given Kustomization.
