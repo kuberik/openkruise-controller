@@ -194,6 +194,7 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+GIT_CLIFF ?= $(LOCALBIN)/git-cliff
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.6.0
@@ -203,6 +204,7 @@ ENVTEST_VERSION ?= $(shell go list -m -f "{{ .Version }}" sigs.k8s.io/controller
 #ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST binaries (i.e. 1.31)
 ENVTEST_K8S_VERSION ?= $(shell go list -m -f "{{ .Version }}" k8s.io/api | awk -F'[v.]' '{printf "1.%d", $$3}')
 GOLANGCI_LINT_VERSION ?= v2.3.0
+GIT_CLIFF_VERSION ?= 2.8.0
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
@@ -247,3 +249,36 @@ mv $(1) $(1)-$(3) ;\
 } ;\
 ln -sf $$(realpath $(1)-$(3)) $(1)
 endef
+
+.PHONY: git-cliff
+git-cliff: $(GIT_CLIFF) ## Download git-cliff locally if necessary.
+$(GIT_CLIFF): $(LOCALBIN)
+	@[ -f "$(GIT_CLIFF)-$(GIT_CLIFF_VERSION)" ] || { \
+		echo "Downloading git-cliff $(GIT_CLIFF_VERSION)..."; \
+		case "$(shell uname -s)-$(shell uname -m)" in \
+			"Darwin-arm64") \
+				curl -L "https://github.com/orhun/git-cliff/releases/download/v$(GIT_CLIFF_VERSION)/git-cliff-$(GIT_CLIFF_VERSION)-aarch64-apple-darwin.tar.gz" | \
+				tar xz -C $(LOCALBIN) --strip-components=1 git-cliff-$(GIT_CLIFF_VERSION)/git-cliff ;; \
+			"Darwin-x86_64") \
+				curl -L "https://github.com/orhun/git-cliff/releases/download/v$(GIT_CLIFF_VERSION)/git-cliff-$(GIT_CLIFF_VERSION)-x86_64-apple-darwin.tar.gz" | \
+				tar xz -C $(LOCALBIN) --strip-components=1 git-cliff-$(GIT_CLIFF_VERSION)/git-cliff ;; \
+			"Linux-x86_64") \
+				curl -L "https://github.com/orhun/git-cliff/releases/download/v$(GIT_CLIFF_VERSION)/git-cliff-$(GIT_CLIFF_VERSION)-x86_64-unknown-linux-gnu.tar.gz" | \
+				tar xz -C $(LOCALBIN) --strip-components=1 git-cliff-$(GIT_CLIFF_VERSION)/git-cliff ;; \
+			"Linux-aarch64") \
+				curl -L "https://github.com/orhun/git-cliff/releases/download/v$(GIT_CLIFF_VERSION)/git-cliff-$(GIT_CLIFF_VERSION)-aarch64-unknown-linux-gnu.tar.gz" | \
+				tar xz -C $(LOCALBIN) --strip-components=1 git-cliff-$(GIT_CLIFF_VERSION)/git-cliff ;; \
+			*) echo "Unsupported platform: $(shell uname -s)-$(shell uname -m)" && exit 1 ;; \
+		esac; \
+		mv $(GIT_CLIFF) $(GIT_CLIFF)-$(GIT_CLIFF_VERSION); \
+	} ;\
+	ln -sf $(GIT_CLIFF)-$(GIT_CLIFF_VERSION) $(GIT_CLIFF)
+
+# Release notes generation
+.PHONY: changelog
+changelog: git-cliff ## Generate changelog
+	$(GIT_CLIFF) --tag $(VERSION) --output CHANGELOG.md
+
+.PHONY: changelog-current
+changelog-current: git-cliff ## Generate changelog for the current release
+	$(GIT_CLIFF) --latest --strip all --output CHANGELOG-current.md
