@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add release workflow and changelog generation
 
 
+### Chore
+
+- Release version v0.1.0
+
+
 ### Fix
 
 - Clear readyAt annotation when step becomes not ready
