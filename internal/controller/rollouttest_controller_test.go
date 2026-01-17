@@ -1124,5 +1124,99 @@ var _ = Describe("RolloutTest Controller", func() {
 				Expect(readyCondition.Message).To(ContainSubstring("rollout is stalled"))
 			})
 		})
+		It("should NOT cancel the test if it already Succeeded, even if rollout becomes stalled", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutTestReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Updating Rollout to step 1, paused")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			rollout.Status.CurrentStepIndex = 1
+			if rollout.Status.CanaryStatus == nil {
+				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+			}
+			rollout.Status.CanaryStatus.CanaryRevision = "v1"
+			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.Conditions = nil // Ensure no stalled condition initially
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			By("Reconciling - should create job")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying Job was created")
+			var jobs batchv1.JobList
+			Expect(k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": resourceName})).To(Succeed())
+			Expect(jobs.Items).To(HaveLen(1))
+			job := &jobs.Items[0]
+
+			By("Setting job to Succeeded")
+			var freshJob batchv1.Job
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: namespace}, &freshJob)).To(Succeed())
+			now := metav1.Now()
+			freshJob.Status.StartTime = &now
+			freshJob.Status.CompletionTime = &now
+			freshJob.Status.Succeeded = 1
+			freshJob.Status.Active = 0
+			freshJob.Status.Failed = 0
+			freshJob.Status.Conditions = []batchv1.JobCondition{
+				{
+					Type:               batchv1.JobSuccessCriteriaMet,
+					Status:             corev1.ConditionTrue,
+					LastProbeTime:      now,
+					LastTransitionTime: now,
+				},
+				{
+					Type:               batchv1.JobComplete,
+					Status:             corev1.ConditionTrue,
+					LastProbeTime:      now,
+					LastTransitionTime: now,
+				},
+			}
+			Expect(k8sClient.Status().Update(ctx, &freshJob)).To(Succeed())
+
+			// Do NOT reconcile yet. Status is still Running.
+			// Now simulate Rollout becoming Stalled CONCURRENTLY (or before controller catches up)
+
+			By("Updating Rollout to Stalled")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			rollout.Status.Conditions = append(rollout.Status.Conditions, kruiserolloutv1beta1.RolloutCondition{
+				Type:   kruiserolloutv1beta1.RolloutConditionType("Stalled"),
+				Status: corev1.ConditionTrue,
+				Reason: "SomeReason",
+			})
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			By("Reconciling - should NOT cancel the test because it already Succeeded")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying job was deleted (cleanup is expected)")
+			// Cleanup is expected behavior for Stalled rollout
+			// But Status should remain Succeeded
+			for i := 0; i < 10; i++ {
+				var deletedJob batchv1.Job
+				err = k8sClient.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: namespace}, &deletedJob)
+				if errors.IsNotFound(err) {
+					break
+				}
+				if !deletedJob.DeletionTimestamp.IsZero() && len(deletedJob.Finalizers) > 0 {
+					deletedJob.Finalizers = []string{}
+					_ = k8sClient.Update(ctx, &deletedJob)
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			var deletedJob batchv1.Job
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: namespace}, &deletedJob)
+			Expect(errors.IsNotFound(err)).To(BeTrue())
+
+			By("Verifying RolloutTest status PRESERVED as Succeeded (not Cancelled)")
+			var rt rolloutv1alpha1.RolloutTest
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &rt)).To(Succeed())
+			Expect(rt.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseSucceeded))
+			Expect(rt.Status.JobName).To(Equal(job.Name)) // JobName should persist
+		})
 	})
 })

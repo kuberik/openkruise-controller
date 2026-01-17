@@ -196,6 +196,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			By("Setting up RolloutTest as passed")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollouttest", Namespace: namespace}, rolloutTest)).To(Succeed())
 			rolloutTest.Status.ObservedCanaryRevision = "v1"
+			rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseSucceeded
 			now := metav1.Now()
 			rolloutTest.Status.Conditions = []metav1.Condition{
 				{
@@ -355,6 +356,70 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			readyAtValue, exists := rollout.Annotations[readyAtKey]
 			Expect(exists).To(BeFalse(), "readyAt annotation should not be set when test has no conditions")
 			Expect(readyAtValue).To(BeEmpty())
+		})
+
+		It("should NOT set readyAt when RolloutTest is Cancelled", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Setting up Rollout at step 1, paused")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Status.CanaryStatus == nil {
+				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+			}
+			rollout.Status.CanaryStatus.CurrentStepIndex = 1
+			rollout.Status.CanaryStatus.CanaryRevision = "v1"
+			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			By("Setting up RolloutTest in Cancelled state")
+			now := metav1.Now()
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollouttest", Namespace: namespace}, rolloutTest)).To(Succeed())
+			rolloutTest.Status.ObservedCanaryRevision = "v1"
+			rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseCancelled
+			rolloutTest.Status.FailedPods = 2
+			// Cancelled tests have Failed condition = False but should be treated as failed
+			rolloutTest.Status.Conditions = []metav1.Condition{
+				{
+					Type:               "Ready",
+					Status:             metav1.ConditionTrue,
+					Reason:             "JobCancelled",
+					LastTransitionTime: now,
+				},
+				{
+					Type:               "Failed",
+					Status:             metav1.ConditionFalse,
+					Reason:             "JobCancelled",
+					LastTransitionTime: now,
+				},
+			}
+			Expect(k8sClient.Status().Update(ctx, rolloutTest)).To(Succeed())
+
+			By("Setting started-at annotation")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Annotations == nil {
+				rollout.Annotations = make(map[string]string)
+			}
+			rollout.Annotations["internal.rollout.kuberik.io/step-1-started-at"] = time.Now().Add(-10 * time.Second).Format(time.RFC3339)
+			rollout.Annotations["internal.rollout.kuberik.io/last-step-index"] = "1"
+			Expect(k8sClient.Update(ctx, rollout)).To(Succeed())
+
+			By("Reconciling")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying readyAt annotation is NOT set")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			_, exists := rollout.Annotations["internal.rollout.kuberik.io/step-1-ready-at"]
+			Expect(exists).To(BeFalse(), "readyAt should NOT be set when test is Cancelled")
 		})
 
 		It("should clear Stalled condition when within deadline", func() {
@@ -532,7 +597,92 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			Expect(rollout.Annotations["internal.rollout.kuberik.io/step-1-last-revision"]).To(Equal("v2"))
 		})
 
+		It("should clear Stalled condition when canary revision changes (test failure scenario)", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Setting up Rollout at step 1 with canary v1 and Stalled condition from test failure")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Status.CanaryStatus == nil {
+				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+			}
+			rollout.Status.CanaryStatus.CurrentStepIndex = 1
+			rollout.Status.CanaryStatus.CanaryRevision = "v1"
+			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			// Set Stalled condition from previous test failure for canary v1
+			rollout.Status.Conditions = []kruiserolloutv1beta1.RolloutCondition{
+				{
+					Type:               kruiserolloutv1beta1.RolloutConditionType("Stalled"),
+					Status:             corev1.ConditionTrue,
+					Reason:             "RolloutTestFailed",
+					Message:            "Rollout tests failed for current step", // OLD format - no revision!
+					LastTransitionTime: metav1.Now(),
+					LastUpdateTime:     metav1.Now(),
+				},
+			}
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			By("Changing canary revision to v2")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			rollout.Status.CanaryStatus.CanaryRevision = "v2"
+			if rollout.Annotations == nil {
+				rollout.Annotations = make(map[string]string)
+			}
+			rollout.Annotations["internal.rollout.kuberik.io/last-step-index"] = "1"
+			rollout.Annotations["internal.rollout.kuberik.io/step-1-started-at"] = time.Now().Format(time.RFC3339)
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+			Expect(k8sClient.Update(ctx, rollout)).To(Succeed())
+
+			By("Setting up passing test for new canary v2")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollouttest", Namespace: namespace}, rolloutTest)).To(Succeed())
+			rolloutTest.Status.ObservedCanaryRevision = "v2"
+			rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseSucceeded
+			now := metav1.Now()
+			rolloutTest.Status.Conditions = []metav1.Condition{
+				{
+					Type:               "Ready",
+					Status:             metav1.ConditionTrue,
+					Reason:             "JobSucceeded",
+					LastTransitionTime: now,
+				},
+			}
+			Expect(k8sClient.Status().Update(ctx, rolloutTest)).To(Succeed())
+
+			By("Reconciling - should clear Stalled condition because canary changed")
+			for i := 0; i < 2; i++ {
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+					NamespacedName: types.NamespacedName{
+						Name:      "test-rollout",
+						Namespace: namespace,
+					},
+				})
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			By("Verifying Stalled condition is cleared")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+
+			var stalledCondition *kruiserolloutv1beta1.RolloutCondition
+			if rollout.Status.Conditions != nil {
+				for i := range rollout.Status.Conditions {
+					if rollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
+						stalledCondition = &rollout.Status.Conditions[i]
+						break
+					}
+				}
+			}
+
+			// Stalled condition should be cleared or False
+			if stalledCondition != nil {
+				Expect(stalledCondition.Status).To(Equal(corev1.ConditionFalse),
+					"Stalled condition should be False when canary revision changes")
+			}
+		})
 		It("should clear Stalled condition when observing new canary (even without annotation change)", func() {
+
 			ctx := context.Background()
 			controllerReconciler := &RolloutStepGateReconciler{
 				Client: k8sClient,

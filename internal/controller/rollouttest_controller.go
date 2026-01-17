@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -94,16 +95,29 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 		// Check if rollout has moved to a different step (manually approved) or is stalled
 		// If CurrentStepIndex is no longer at the RolloutTest's StepIndex, or Rollout is Stalled, cancel the job
-		isStalled := r.isRolloutStalled(&rollout)
-		if rollout.Status.CurrentStepIndex != rolloutTest.Spec.StepIndex || isStalled {
+		isStalled, stallReason := r.isRolloutStalled(&rollout)
+		// If stalled due to TestFailed, do NOT cancel the job - let it be reported as Failed
+		shouldCancel := isStalled && stallReason != "RolloutTestFailed"
+
+		if rollout.Status.CurrentStepIndex != rolloutTest.Spec.StepIndex || shouldCancel {
 			cancellationMessage := "Test job was cancelled because rollout step moved forward"
-			if isStalled {
-				log.Info("Rollout is stalled, cancelling job")
-				cancellationMessage = "Test job was cancelled because rollout is stalled"
+			if shouldCancel {
+				log.Info("Rollout is stalled (non-test reason), cancelling job", "reason", stallReason)
+				cancellationMessage = fmt.Sprintf("Test job was cancelled because rollout is stalled (%s)", stallReason)
 			} else {
 				log.Info("Rollout step changed, cancelling job",
 					"currentStep", rollout.Status.CurrentStepIndex,
 					"testStep", rolloutTest.Spec.StepIndex)
+			}
+			// If job finished checking, update status before deletion to preserve Succeeded/Failed state
+			if r.isJobSucceeded(job) || r.isJobFailed(job) {
+				currentRevision := ""
+				if rollout.Status.CanaryStatus != nil {
+					currentRevision = rollout.Status.CanaryStatus.CanaryRevision
+				}
+				// Update status to preserve terminal state (Succeeded/Failed)
+				// The cache is automatically updated by controller-runtime
+				_, _ = r.updateStatus(ctx, &rolloutTest, job, currentRevision)
 			}
 
 			if err := r.Delete(ctx, job); err != nil && !errors.IsNotFound(err) {
@@ -198,10 +212,41 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// If Job does not exist, check if we should create one
+	// First check if the canary revision has changed - if so, reset status
+	currentRevision := ""
+	if rollout.Status.CanaryStatus != nil {
+		currentRevision = rollout.Status.CanaryStatus.CanaryRevision
+	}
+
+	// If canary revision changed since last observation, reset the test status
+	if rolloutTest.Status.ObservedCanaryRevision != "" &&
+		currentRevision != "" &&
+		rolloutTest.Status.ObservedCanaryRevision != currentRevision {
+		log.Info("Canary revision changed, resetting test status",
+			"oldRevision", rolloutTest.Status.ObservedCanaryRevision,
+			"newRevision", currentRevision)
+		rolloutTest.Status.JobName = ""
+		rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseWaitingForStep
+		rolloutTest.Status.RetryCount = 0
+		rolloutTest.Status.ActivePods = 0
+		rolloutTest.Status.SucceededPods = 0
+		rolloutTest.Status.FailedPods = 0
+		rolloutTest.Status.ObservedCanaryRevision = ""
+		// Clear conditions
+		rolloutTest.Status.Conditions = []metav1.Condition{}
+		if err := r.Status().Update(ctx, &rolloutTest); err != nil {
+			log.Error(err, "failed to reset status after canary change")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
 	// We trigger if CurrentStepIndex matches StepIndex AND canary is paused
 	if rollout.Status.CurrentStepIndex == rolloutTest.Spec.StepIndex {
 		// Check if rollout is stalled
-		if r.isRolloutStalled(&rollout) {
+		isStalled, stallReason := r.isRolloutStalled(&rollout)
+		// If stalled due to TestFailed, ignore and allow retry/creation (don't mark as Cancelled)
+		if isStalled && stallReason != "RolloutTestFailed" {
 			log.Info("Rollout is stalled, not creating Job", "step", rolloutTest.Spec.StepIndex)
 			if rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseCancelled {
 				rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseCancelled
@@ -246,17 +291,17 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			// Set phase to WaitingForStep
 			rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseWaitingForStep
 			rolloutTest.Status.JobName = ""
+			rolloutTest.Status.RetryCount = 0
+			rolloutTest.Status.ActivePods = 0
+			rolloutTest.Status.SucceededPods = 0
+			rolloutTest.Status.FailedPods = 0
 			if err := r.Status().Update(ctx, &rolloutTest); err != nil {
 				log.Error(err, "failed to update status")
 			}
 			return ctrl.Result{}, nil
 		}
 		log.Info("Rollout is at target step and canary is paused, creating Job", "step", rolloutTest.Spec.StepIndex)
-		// Get the current canaryRevision (may be empty if CanaryStatus is nil)
-		currentRevision := ""
-		if rollout.Status.CanaryStatus != nil {
-			currentRevision = rollout.Status.CanaryStatus.CanaryRevision
-		}
+		// currentRevision already declared above
 		return r.createJob(ctx, &rolloutTest, currentRevision)
 	}
 
@@ -464,16 +509,17 @@ func (r *RolloutTestReconciler) isCanaryPaused(rollout *kruiserolloutv1beta1.Rol
 }
 
 // isRolloutStalled checks if the rollout is in a stalled state
-func (r *RolloutTestReconciler) isRolloutStalled(rollout *kruiserolloutv1beta1.Rollout) bool {
+// isRolloutStalled checks if the rollout is in a stalled state and returns the reason
+func (r *RolloutTestReconciler) isRolloutStalled(rollout *kruiserolloutv1beta1.Rollout) (bool, string) {
 	if rollout.Status.Conditions == nil {
-		return false
+		return false, ""
 	}
 	for _, condition := range rollout.Status.Conditions {
 		if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") && condition.Status == corev1.ConditionTrue {
-			return true
+			return true, condition.Reason
 		}
 	}
-	return false
+	return false, ""
 }
 
 // SetupWithManager sets up the controller with the Manager.

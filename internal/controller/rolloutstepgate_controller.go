@@ -91,39 +91,46 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, nil
 	}
 
-	// Check if this is a new rollout version - if so, clear Stalled condition
-	// Do this early before any Updates that might affect annotations
 	currentRevision := rollout.Status.CanaryStatus.CanaryRevision
+	lastRevisionStr := r.getStepAnnotation(&rollout, currentStepIndex, internalAnnotationStepLastRevisionPrefix)
 
-	// Check if Stalled condition exists for a different canary revision
-	if err := r.clearStalledConditionIfNewCanary(ctx, &rollout, currentRevision); err != nil {
-		log.Error(err, "failed to check/clear Stalled condition for new canary")
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+	// Clear Stalled at TOP if context changed (triggered by external change: new canary/step/revision)
+	// Check if existing Stalled condition has a different canary revision in its message
+	if rollout.Status.Conditions != nil {
+		for _, condition := range rollout.Status.Conditions {
+			if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") && condition.Status == corev1.ConditionTrue {
+				stalledRevision := r.extractCanaryRevisionFromMessage(condition.Message)
+				if stalledRevision != "" && stalledRevision != currentRevision {
+					log.Info("Clearing Stalled condition - new canary detected",
+						"stalledCanary", stalledRevision,
+						"currentCanary", currentRevision)
+					if r.clearStalledCondition(&rollout) {
+						if err := r.Status().Update(ctx, &rollout); err != nil {
+							log.Error(err, "failed to clear Stalled condition")
+							return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+						}
+					}
+				}
+				break
+			}
+		}
 	}
 
-	// Check if rollout was deployed by kustomize and if kuberik rollout has failed bake status
-	bakeFailed, err := r.checkKuberikRolloutBakeStatus(ctx, &rollout)
+	// Check kuberik rollout bake status
+	bakeFailed, bakeMessage, err := r.getBakeFailureStatus(ctx, &rollout)
 	if err != nil {
 		log.Error(err, "failed to check kuberik rollout bake status")
 		// Non-fatal, continue with normal flow
 	}
+	log.V(1).Info("Bake status check", "bakeFailed", bakeFailed, "message", bakeMessage)
 
-	// Refetch rollout after checking kuberik bake status to ensure we have latest status
-	if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
-	}
-
-	lastRevisionStr := r.getStepAnnotation(&rollout, currentStepIndex, internalAnnotationStepLastRevisionPrefix)
+	// Handle revision annotation updates
 	if lastRevisionStr != "" && lastRevisionStr != currentRevision {
-		// New rollout version detected, clear Stalled condition
-		log.Info("New rollout version detected, clearing Stalled condition",
+		log.Info("New rollout version detected",
 			"step", currentStepIndex,
 			"oldRevision", lastRevisionStr,
 			"newRevision", currentRevision)
-		if err := r.clearStalledCondition(ctx, &rollout); err != nil {
-			log.Error(err, "failed to clear Stalled condition for new revision")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-		}
+
 		// Update the last revision annotation
 		if err := r.setStepAnnotation(ctx, &rollout, currentStepIndex, internalAnnotationStepLastRevisionPrefix, currentRevision); err != nil {
 			log.Error(err, "failed to update last revision annotation")
@@ -134,6 +141,16 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			log.Error(err, "failed to cleanup step annotations for new revision")
 			// Non-fatal, continue
 		}
+
+		// Clear any existing Stalled condition unconditionally as we have a new revision
+		if r.clearStalledCondition(&rollout) {
+			log.Info("Clearing Stalled condition for new revision")
+			if err := r.Status().Update(ctx, &rollout); err != nil {
+				log.Error(err, "failed to clear Stalled condition for new revision")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+			}
+		}
+
 		// Refetch rollout after updates
 		if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
 			return ctrl.Result{}, err
@@ -147,30 +164,6 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		// Refetch after update
 		if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
 			return ctrl.Result{}, err
-		}
-	}
-
-	// Check if step has changed - if so, clear Stalled condition
-	if rollout.Annotations != nil {
-		lastStepIndexStr := rollout.Annotations[internalAnnotationLastStepIndex]
-		if lastStepIndexStr != "" {
-			var lastStepIndex int32
-			if _, err := fmt.Sscanf(lastStepIndexStr, "%d", &lastStepIndex); err == nil {
-				if lastStepIndex != currentStepIndex {
-					// Step changed, clear Stalled condition
-					log.Info("Step changed, clearing Stalled condition",
-						"oldStep", lastStepIndex,
-						"newStep", currentStepIndex)
-					if err := r.clearStalledCondition(ctx, &rollout); err != nil {
-						log.Error(err, "failed to clear Stalled condition for step change")
-						return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-					}
-					// Refetch rollout after status update
-					if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
-						return ctrl.Result{}, err
-					}
-				}
-			}
 		}
 	}
 
@@ -212,10 +205,17 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	// Check if this step has auto-approval configuration
 	readyTimeoutStr := r.getStepAnnotation(&rollout, currentStepIndex, annotationStepReadyTimeoutPrefix)
-	readyTimeout, err := time.ParseDuration(readyTimeoutStr)
-	if err != nil {
-		log.Error(err, "invalid step-ready-timeout duration", "step", currentStepIndex, "value", readyTimeoutStr)
-		return ctrl.Result{}, nil
+	var readyTimeout time.Duration
+	if readyTimeoutStr != "" {
+		var err error
+		readyTimeout, err = time.ParseDuration(readyTimeoutStr)
+		if err != nil {
+			log.Error(err, "invalid step-ready-timeout duration", "step", currentStepIndex, "value", readyTimeoutStr)
+			return ctrl.Result{}, nil
+		}
+	} else {
+		// Default to infinite timeout (100 years) when no annotation is set
+		readyTimeout = 100 * 365 * 24 * time.Hour
 	}
 
 	// Get step-bake-time if configured
@@ -247,21 +247,10 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	// Evaluate test status
-	allPassed, anyFailedTests := r.evaluateTests(relevantTests)
+	allPassed, anyFailedTests, failedTestName := r.evaluateTests(relevantTests)
 	anyFailed := anyFailedTests || bakeFailed
 
 	now := time.Now()
-
-	// Check for failure conditions first
-	if anyFailed {
-		if bakeFailed {
-			log.Info("Kuberik rollout bake failed, keeping paused", "step", currentStepIndex)
-		} else {
-			log.Info("Tests failed for step, keeping paused", "step", currentStepIndex)
-		}
-		// Keep paused - user needs to intervene
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
 
 	// Get when the step started
 	startedAtStr := r.getStepAnnotation(&rollout, currentStepIndex, internalAnnotationStepStartedAtPrefix)
@@ -272,7 +261,7 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if err := r.setStepAnnotation(ctx, &rollout, currentStepIndex, internalAnnotationStepStartedAtPrefix, startedAt.Format(time.RFC3339)); err != nil {
 			return ctrl.Result{}, err
 		}
-		log.Info("Step start time recorded", "step", currentStepIndex, "startedAt", startedAt)
+		log.Info("Step start time recorded - returning early for requeue", "step", currentStepIndex, "startedAt", startedAt)
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	} else {
 		var err error
@@ -291,12 +280,17 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	deadline := startedAt.Add(readyTimeout)
 
 	// Determine when the step became ready for approval
-	// Ready = step paused AND all tests passed (whichever happens later)
 	readyAtStr := r.getStepAnnotation(&rollout, currentStepIndex, internalAnnotationStepReadyAtPrefix)
 	var readyAt time.Time
 
-	if isStepPaused && allPassed {
-		// Both conditions are met now
+	stepIsReady := false
+
+	// If already ready (annotation set) OR conditions met within deadline
+	// Note: We keep readyAt if it was previously set AND tests are still passing, even if past deadline
+	// The cleanup logic below (lines 300-318) will clear readyAt if tests fail
+	if isStepPaused && allPassed && (deadline.After(now) || readyAtStr != "") {
+		// Both conditions are met now or were met previously
+		stepIsReady = true
 		if readyAtStr == "" {
 			// First time both conditions are met, record it
 			readyAt = now
@@ -304,6 +298,10 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				return ctrl.Result{}, err
 			}
 			log.Info("Step ready for approval", "step", currentStepIndex, "readyAt", readyAt)
+			// Refetch after update
+			if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
+				return ctrl.Result{}, err
+			}
 		} else {
 			// We've been ready before, use stored timestamp
 			var err error
@@ -318,9 +316,7 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 		}
 	} else {
-		// Not ready yet - either step not paused or tests not all passed
-		// Clear readyAt annotation if it exists, since step is no longer ready
-		// Note: We only clear ready-at, not started-at (started-at tracks when step started, not when it became ready)
+		// Not ready yet
 		if readyAtStr != "" {
 			log.Info("Step no longer ready, clearing readyAt annotation", "step", currentStepIndex)
 			readyAtKey := fmt.Sprintf(internalAnnotationStepReadyAtPrefix, currentStepIndex)
@@ -329,7 +325,6 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					delete(rollout.Annotations, readyAtKey)
 					if err := r.Update(ctx, &rollout); err != nil {
 						log.Error(err, "failed to clear readyAt annotation")
-						// Non-fatal, continue
 					} else {
 						// Refetch rollout after cleanup
 						if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
@@ -345,39 +340,77 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		} else if !allPassed {
 			log.Info("Waiting for all tests to pass", "step", currentStepIndex)
 		}
+	}
 
-		// Check for timeout only if step is NOT ready yet
-		if now.After(deadline) {
-			log.Info("Step ready-timeout exceeded before becoming ready, keeping paused", "step", currentStepIndex, "deadline", deadline, "now", now)
-			// Refetch rollout to ensure we have latest resource version before status update
-			if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
-				return ctrl.Result{}, err
-			}
-			// Set Stalled condition for kstatus compatibility (maps to FailedStatus)
-			if err := r.setStalledCondition(ctx, &rollout, currentStepIndex, deadline, readyTimeout); err != nil {
+	// Set Stalled at END based on current failure state
+	// Note: Clearing happens at TOP when external changes detected
+	log.V(1).Info("Stalled condition decision point", "bakeFailed", bakeFailed, "anyFailedTests", anyFailedTests, "stepIsReady", stepIsReady, "deadlineExceeded", now.After(deadline))
+	if bakeFailed {
+		log.Info("Kuberik rollout bake failed, setting Stalled condition", "step", currentStepIndex)
+		modified, err := r.setStalledCondition(ctx, &rollout, currentStepIndex, "KuberikRolloutBakeFailed", bakeMessage)
+		if err != nil {
+			log.Error(err, "failed to set Stalled condition (annotation cleanup)")
+			return ctrl.Result{}, err
+		}
+		if modified {
+			if err := r.Status().Update(ctx, &rollout); err != nil {
 				log.Error(err, "failed to set Stalled condition")
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 			}
-			// Keep paused - user needs to intervene
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
-
-		// Clear Stalled condition if it exists (we're within deadline)
-		if err := r.clearStalledCondition(ctx, &rollout); err != nil {
-			log.Error(err, "failed to clear Stalled condition")
-			// Non-fatal, continue
+	} else if anyFailedTests {
+		log.Info("Tests failed for step, setting Stalled condition", "step", currentStepIndex)
+		message := fmt.Sprintf("Rollout tests failed for current step (test %s, step %d)", failedTestName, currentStepIndex)
+		modified, err := r.setStalledCondition(ctx, &rollout, currentStepIndex, "RolloutTestFailed", message)
+		if err != nil {
+			log.Error(err, "failed to set Stalled condition (annotation cleanup)")
+			return ctrl.Result{}, err
 		}
+		if modified {
+			if err := r.Status().Update(ctx, &rollout); err != nil {
+				log.Error(err, "failed to set Stalled condition for failed tests")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+			}
+		}
+	} else if !stepIsReady && now.After(deadline) {
+		log.Info("Step ready-timeout exceeded, keeping paused", "step", currentStepIndex, "deadline", deadline)
+		message := fmt.Sprintf("Step %d step-ready-timeout (%v) exceeded at %v for canary %s. Rollout is paused and requires manual intervention.", currentStepIndex, readyTimeout, deadline.Format(time.RFC3339), currentRevision)
+		modified, err := r.setStalledCondition(ctx, &rollout, currentStepIndex, "StepReadyTimeoutExceeded", message)
+		if err != nil {
+			log.Error(err, "failed to set Stalled condition (annotation cleanup)")
+			return ctrl.Result{}, err
+		}
+		if modified {
+			if err := r.Status().Update(ctx, &rollout); err != nil {
+				log.Error(err, "failed to set Stalled condition")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+			}
+		}
+	} else {
+		// We are not stalled (no bake failure, no test failure, no timeout)
+		// Clear any existing Stalled condition to enable recovery
+		if r.clearStalledCondition(&rollout) {
+			log.Info("Clearing Stalled condition - rollout is healthy")
+			if err := r.Status().Update(ctx, &rollout); err != nil {
+				log.Error(err, "failed to clear Stalled condition")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+			}
+		}
+	}
+	// Note: We don't clear here when healthy - clearing only happens at TOP when context changes
 
-		// Requeue to check again
+	// Determine Result
+	if anyFailed {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	if !stepIsReady {
+		// Check for timeout again soon
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// Step is ready - no timeout check needed, just wait for bake-time and auto-approve
-	// Clear Stalled condition if it exists (step became ready, so no timeout)
-	if err := r.clearStalledCondition(ctx, &rollout); err != nil {
-		log.Error(err, "failed to clear Stalled condition")
-		// Non-fatal, continue
-	}
+	// Step is ready, wait for bake-time
+	// Clear Stalled condition handled above in consolidated logic
 
 	// Check if step-bake-time has elapsed since step became ready
 	if bakeTime > 0 {
@@ -538,37 +571,33 @@ func (r *RolloutStepGateReconciler) getRolloutTestsForStep(ctx context.Context, 
 }
 
 // evaluateTests checks the status of all tests
-// Returns: (allPassed, anyFailed)
-func (r *RolloutStepGateReconciler) evaluateTests(tests []rolloutv1alpha1.RolloutTest) (bool, bool) {
+// Returns: (allPassed, anyFailed, failedTestName)
+func (r *RolloutStepGateReconciler) evaluateTests(tests []rolloutv1alpha1.RolloutTest) (bool, bool, string) {
 	if len(tests) == 0 {
 		// No tests means we can't approve yet - wait for tests to be created
-		return false, false
+		return false, false, ""
 	}
 
 	allPassed := true
 	anyFailed := false
+	failedTestName := ""
 	anyInProgress := false
 
 	for _, test := range tests {
-		ready := false
-		failed := false
-
-		for _, condition := range test.Status.Conditions {
-			if condition.Type == "Ready" {
-				ready = condition.Status == metav1.ConditionTrue
-			}
-			if condition.Type == "Failed" {
-				failed = condition.Status == metav1.ConditionTrue
-			}
-		}
-
-		if failed {
+		// Only check Phase - it's the single source of truth
+		// This avoids race conditions with partial condition updates
+		switch test.Status.Phase {
+		case rolloutv1alpha1.RolloutTestPhaseFailed, rolloutv1alpha1.RolloutTestPhaseCancelled:
+			// Failed or Cancelled = test failed
 			anyFailed = true
 			allPassed = false
-		} else if ready {
-			// Test passed
-		} else {
-			// Test still in progress
+			if failedTestName == "" {
+				failedTestName = test.Name
+			}
+		case rolloutv1alpha1.RolloutTestPhaseSucceeded:
+			// Test passed, continue to next test
+		default:
+			// Running, Pending, WaitingForStep, or empty = still in progress
 			anyInProgress = true
 			allPassed = false
 		}
@@ -576,93 +605,16 @@ func (r *RolloutStepGateReconciler) evaluateTests(tests []rolloutv1alpha1.Rollou
 
 	// If any failed, return immediately
 	if anyFailed {
-		return false, true
+		return false, true, failedTestName
 	}
 
 	// If all passed and none in progress, all passed
 	if allPassed && !anyInProgress {
-		return true, false
+		return true, false, ""
 	}
 
 	// Otherwise, still waiting
-	return false, false
-}
-
-// setStalledCondition sets the Stalled condition on the Rollout when step-ready-timeout is exceeded
-func (r *RolloutStepGateReconciler) setStalledCondition(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout, stepIndex int32, deadline time.Time, readyTimeout time.Duration) error {
-	// Check if condition already exists and is up to date
-	if rollout.Status.Conditions != nil {
-		for _, condition := range rollout.Status.Conditions {
-			if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") && condition.Status == corev1.ConditionTrue {
-				// Condition already set, no need to update
-				return nil
-			}
-		}
-	}
-
-	// Initialize conditions slice if nil
-	if rollout.Status.Conditions == nil {
-		rollout.Status.Conditions = []kruiserolloutv1beta1.RolloutCondition{}
-	}
-
-	currentRevision := rollout.Status.CanaryStatus.CanaryRevision
-	message := fmt.Sprintf("Step %d step-ready-timeout (%v) exceeded at %v for canary %s. Rollout is paused and requires manual intervention.", stepIndex, readyTimeout, deadline.Format(time.RFC3339), currentRevision)
-	now := metav1.Now()
-
-	// Find and update existing condition or add new one
-	found := false
-	for i := range rollout.Status.Conditions {
-		if rollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
-			rollout.Status.Conditions[i].Status = corev1.ConditionTrue
-			rollout.Status.Conditions[i].Reason = "StepReadyTimeoutExceeded"
-			rollout.Status.Conditions[i].Message = message
-			rollout.Status.Conditions[i].LastTransitionTime = now
-			rollout.Status.Conditions[i].LastUpdateTime = now
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		rollout.Status.Conditions = append(rollout.Status.Conditions, kruiserolloutv1beta1.RolloutCondition{
-			Type:               kruiserolloutv1beta1.RolloutConditionType("Stalled"),
-			Status:             corev1.ConditionTrue,
-			Reason:             "StepReadyTimeoutExceeded",
-			Message:            message,
-			LastTransitionTime: now,
-			LastUpdateTime:     now,
-		})
-	}
-
-	return r.Status().Update(ctx, rollout)
-}
-
-// clearStalledConditionIfNewCanary checks if the Stalled condition is for a different canary revision
-// and clears it if so. The canary revision is embedded in the condition message.
-func (r *RolloutStepGateReconciler) clearStalledConditionIfNewCanary(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout, currentRevision string) error {
-	if rollout.Status.Conditions == nil || currentRevision == "" {
-		return nil
-	}
-
-	// Find Stalled condition and check if it's for a different canary
-	for _, condition := range rollout.Status.Conditions {
-		if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") && condition.Status == corev1.ConditionTrue {
-			// Extract canary revision from message
-			// Message format: "Step X step-ready-timeout (...) exceeded at ... for canary REVISION. ..."
-			stalledRevision := r.extractCanaryRevisionFromMessage(condition.Message)
-			if stalledRevision != "" && stalledRevision != currentRevision {
-				// Stalled condition is for a different canary, clear it
-				log := logf.FromContext(ctx)
-				log.Info("Stalled condition is for different canary, clearing it",
-					"stalledCanary", stalledRevision,
-					"currentCanary", currentRevision)
-				return r.clearStalledCondition(ctx, rollout)
-			}
-			break
-		}
-	}
-
-	return nil
+	return false, false, ""
 }
 
 // extractCanaryRevisionFromMessage extracts the canary revision from the Stalled condition message
@@ -693,40 +645,31 @@ func (r *RolloutStepGateReconciler) extractCanaryRevisionFromMessage(message str
 	return ""
 }
 
-// clearStalledCondition clears the Stalled condition on the Rollout
-// It does NOT clear conditions with Reason "KuberikRolloutBakeFailed" as those should persist
-func (r *RolloutStepGateReconciler) clearStalledCondition(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) error {
+// clearStalledCondition clears the Stalled condition.
+// Returns true if the condition was modified, false otherwise.
+func (r *RolloutStepGateReconciler) clearStalledCondition(rollout *kruiserolloutv1beta1.Rollout) bool {
 	if rollout.Status.Conditions == nil {
-		return nil
+		return false
 	}
 
-	// Check if Stalled condition exists and is True, but not for kuberik bake failure
+	// Check if Stalled condition exists and is True
 	stalledExists := false
 	for _, condition := range rollout.Status.Conditions {
 		if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") &&
-			condition.Status == corev1.ConditionTrue &&
-			condition.Reason != "KuberikRolloutBakeFailed" {
+			condition.Status == corev1.ConditionTrue {
 			stalledExists = true
 			break
 		}
 	}
 
 	if !stalledExists {
-		return nil
+		return false
 	}
 
-	// Refetch rollout to ensure we have latest resource version before status update
-	// This is important to avoid conflicts
-	namespacedName := types.NamespacedName{Name: rollout.Name, Namespace: rollout.Namespace}
-	if err := r.Get(ctx, namespacedName, rollout); err != nil {
-		return err
-	}
-
-	// Update the condition to False (only if not KuberikRolloutBakeFailed)
+	// Update the condition to False
 	now := metav1.Now()
 	for i := range rollout.Status.Conditions {
-		if rollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") &&
-			rollout.Status.Conditions[i].Reason != "KuberikRolloutBakeFailed" {
+		if rollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
 			rollout.Status.Conditions[i].Status = corev1.ConditionFalse
 			rollout.Status.Conditions[i].Reason = "WithinDeadline"
 			rollout.Status.Conditions[i].Message = "Step is within step-ready-timeout deadline"
@@ -736,16 +679,13 @@ func (r *RolloutStepGateReconciler) clearStalledCondition(ctx context.Context, r
 		}
 	}
 
-	return r.Status().Update(ctx, rollout)
+	return true
 }
 
-// checkKuberikRolloutBakeStatus checks if the rollout was deployed by kustomize and if the
+// getBakeFailureStatus checks if the rollout was deployed by kustomize and if the
 // associated kuberik Rollout has a failed bake status in its latest history entry.
-// If so, sets the Stalled condition.
-// Returns (bakeFailed, error)
-func (r *RolloutStepGateReconciler) checkKuberikRolloutBakeStatus(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) (bool, error) {
-	log := logf.FromContext(ctx)
-
+// Returns (failed, message, error)
+func (r *RolloutStepGateReconciler) getBakeFailureStatus(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) (bool, string, error) {
 	// Check if rollout has kustomize labels or annotations
 	kustomizeName := rollout.Annotations["kustomize.toolkit.fluxcd.io/name"]
 	if kustomizeName == "" {
@@ -758,7 +698,7 @@ func (r *RolloutStepGateReconciler) checkKuberikRolloutBakeStatus(ctx context.Co
 
 	if kustomizeName == "" || kustomizeNamespace == "" {
 		// Not deployed by kustomize, skip
-		return false, nil
+		return false, "", nil
 	}
 
 	// Get the Kustomization resource
@@ -769,61 +709,67 @@ func (r *RolloutStepGateReconciler) checkKuberikRolloutBakeStatus(ctx context.Co
 	}, &kustomization); err != nil {
 		if client.IgnoreNotFound(err) == nil {
 			// Kustomization not found, skip
-			return false, nil
+			return false, "", nil
 		}
-		return false, fmt.Errorf("failed to get Kustomization %s/%s: %w", kustomizeNamespace, kustomizeName, err)
+		return false, "", fmt.Errorf("failed to get Kustomization %s/%s: %w", kustomizeNamespace, kustomizeName, err)
 	}
 
 	// Find the kuberik Rollout that references this Kustomization
 	kuberikRollout, err := r.findKuberikRolloutForKustomization(ctx, &kustomization)
 	if err != nil {
-		return false, fmt.Errorf("failed to find kuberik Rollout for Kustomization: %w", err)
+		return false, "", fmt.Errorf("failed to find kuberik Rollout for Kustomization: %w", err)
 	}
 	if kuberikRollout == nil {
 		// No kuberik Rollout found, skip
-		return false, nil
+		return false, "", nil
 	}
 
 	// Check if the latest history entry has failed bake status
 	if len(kuberikRollout.Status.History) == 0 {
-		return false, nil
+		return false, "", nil
 	}
 
-	latestEntry := kuberikRollout.Status.History[0]
-	if latestEntry.BakeStatus != nil && *latestEntry.BakeStatus == kuberikrolloutv1alpha1.BakeStatusFailed {
-		// Latest entry has failed bake status, set Stalled condition
-		log.Info("Kuberik Rollout has failed bake status, setting Stalled condition",
-			"kuberikRollout", kuberikRollout.Name,
-			"kuberikRolloutNamespace", kuberikRollout.Namespace,
-			"bakeStatus", *latestEntry.BakeStatus)
+	// Check if we can match specific version
+	currentVersion := rollout.Annotations["version"]
+	var relevantEntry *kuberikrolloutv1alpha1.DeploymentHistoryEntry
 
-		// Set Stalled condition with message indicating kuberik rollout bake failure
-		currentRevision := rollout.Status.CanaryStatus.CanaryRevision
-		message := fmt.Sprintf("Kuberik Rollout %s/%s has failed bake status in latest deployment. Rollout is paused and requires manual intervention.", kuberikRollout.Namespace, kuberikRollout.Name)
-		if currentRevision != "" {
-			message = fmt.Sprintf("Kuberik Rollout %s/%s has failed bake status in latest deployment for canary %s. Rollout is paused and requires manual intervention.", kuberikRollout.Namespace, kuberikRollout.Name, currentRevision)
-		}
-		err := r.setStalledConditionForKuberikBakeFailure(ctx, rollout, message)
-		if err != nil {
-			return true, err
-		}
-		return true, nil
-	}
-
-	// If bake status is not failed, clear any existing Stalled condition with KuberikRolloutBakeFailed reason
-	if rollout.Status.Conditions != nil {
-		for _, condition := range rollout.Status.Conditions {
-			if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") &&
-				condition.Status == corev1.ConditionTrue &&
-				condition.Reason == "KuberikRolloutBakeFailed" {
-				// Clear the condition
-				err := r.clearStalledCondition(ctx, rollout)
-				return false, err
+	if currentVersion != "" {
+		for i := range kuberikRollout.Status.History {
+			entry := &kuberikRollout.Status.History[i]
+			if entry.Version.Tag == currentVersion {
+				relevantEntry = entry
+				break
 			}
 		}
+		// If version is specified but not found in history, assume it's not deployed yet
+		// Do NOT check History[0] in this case as it might be an old failed version
+		if relevantEntry == nil {
+			return false, "", nil
+		}
+	} else if len(kuberikRollout.Status.History) > 0 {
+		// Fallback to latest entry if no version specified
+		relevantEntry = &kuberikRollout.Status.History[0]
 	}
 
-	return false, nil
+	if relevantEntry != nil && relevantEntry.BakeStatus != nil && *relevantEntry.BakeStatus == kuberikrolloutv1alpha1.BakeStatusFailed {
+		// Entry has failed bake status
+		log := logf.FromContext(ctx)
+		log.Info("Kuberik Rollout has failed bake status",
+			"kuberikRollout", kuberikRollout.Name,
+			"kuberikRolloutNamespace", kuberikRollout.Namespace,
+			"bakeStatus", *relevantEntry.BakeStatus,
+			"version", relevantEntry.Version.Tag)
+
+		// Construct message
+		currentRevision := rollout.Status.CanaryStatus.CanaryRevision
+		message := fmt.Sprintf("Kuberik Rollout %s/%s has failed bake status in deployment of version %s. Rollout is paused and requires manual intervention.", kuberikRollout.Namespace, kuberikRollout.Name, relevantEntry.Version.Tag)
+		if currentRevision != "" {
+			message = fmt.Sprintf("Kuberik Rollout %s/%s has failed bake status in latest deployment for canary %s (version %s). Rollout is paused and requires manual intervention.", kuberikRollout.Namespace, kuberikRollout.Name, currentRevision, relevantEntry.Version.Tag)
+		}
+		return true, message, nil
+	}
+
+	return false, "", nil
 }
 
 // findKuberikRolloutForKustomization finds the kuberik Rollout that references the given Kustomization.
@@ -924,25 +870,21 @@ func (r *RolloutStepGateReconciler) findKuberikRolloutForKustomization(ctx conte
 	return nil, nil
 }
 
-// setStalledConditionForKuberikBakeFailure sets the Stalled condition when kuberik rollout bake fails
-func (r *RolloutStepGateReconciler) setStalledConditionForKuberikBakeFailure(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout, message string) error {
-	// Refetch rollout to ensure we have latest resource version before status update
-	// This is important to avoid conflicts
-	namespacedName := types.NamespacedName{Name: rollout.Name, Namespace: rollout.Namespace}
-	if err := r.Get(ctx, namespacedName, rollout); err != nil {
-		return err
-	}
-
-	// Check if condition already exists and is up to date
-	if rollout.Status.Conditions != nil {
-		for _, condition := range rollout.Status.Conditions {
-			if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") &&
-				condition.Status == corev1.ConditionTrue &&
-				condition.Reason == "KuberikRolloutBakeFailed" {
-				// Condition already set with same reason, no need to update
-				return nil
-			}
+// setStalledCondition sets the Stalled condition to True with the given reason and message.
+// Returns true if the condition was modified, false otherwise.
+// setStalledCondition sets the Stalled condition on the Rollout and clears ready-at annotation
+// Returns true if the condition was changed or added
+func (r *RolloutStepGateReconciler) setStalledCondition(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout, stepIndex int32, reason, message string) (bool, error) {
+	// First, explicitly clear the ready-at annotation since the rollout is stalled
+	readyAtKey := fmt.Sprintf(internalAnnotationStepReadyAtPrefix, stepIndex)
+	if _, exists := rollout.Annotations[readyAtKey]; exists {
+		delete(rollout.Annotations, readyAtKey)
+		// We must update the object metadata on the server
+		if err := r.Update(ctx, rollout); err != nil {
+			return false, err
 		}
+		// Note: r.Update refreshes the rollout object, including Status.
+		// So we are working with the latest Status from server, which is what we want.
 	}
 
 	// Initialize conditions slice if nil
@@ -951,17 +893,25 @@ func (r *RolloutStepGateReconciler) setStalledConditionForKuberikBakeFailure(ctx
 	}
 
 	now := metav1.Now()
+	modified := false
 
 	// Find and update existing condition or add new one
 	found := false
 	for i := range rollout.Status.Conditions {
 		if rollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
+			if rollout.Status.Conditions[i].Status == corev1.ConditionTrue &&
+				rollout.Status.Conditions[i].Reason == reason &&
+				rollout.Status.Conditions[i].Message == message {
+				// Condition already set with same status, reason, and message, no need to update
+				return false, nil
+			}
 			rollout.Status.Conditions[i].Status = corev1.ConditionTrue
-			rollout.Status.Conditions[i].Reason = "KuberikRolloutBakeFailed"
+			rollout.Status.Conditions[i].Reason = reason
 			rollout.Status.Conditions[i].Message = message
 			rollout.Status.Conditions[i].LastTransitionTime = now
 			rollout.Status.Conditions[i].LastUpdateTime = now
 			found = true
+			modified = true
 			break
 		}
 	}
@@ -970,18 +920,15 @@ func (r *RolloutStepGateReconciler) setStalledConditionForKuberikBakeFailure(ctx
 		rollout.Status.Conditions = append(rollout.Status.Conditions, kruiserolloutv1beta1.RolloutCondition{
 			Type:               kruiserolloutv1beta1.RolloutConditionType("Stalled"),
 			Status:             corev1.ConditionTrue,
-			Reason:             "KuberikRolloutBakeFailed",
+			Reason:             reason,
 			Message:            message,
 			LastTransitionTime: now,
 			LastUpdateTime:     now,
 		})
+		modified = true
 	}
 
-	err := r.Status().Update(ctx, rollout)
-	if err != nil {
-		return err
-	}
-	return nil
+	return modified, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
