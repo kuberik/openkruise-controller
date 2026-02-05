@@ -940,6 +940,10 @@ func (r *RolloutStepGateReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&rolloutv1alpha1.RolloutTest{},
 			handler.EnqueueRequestsFromMapFunc(r.findRolloutsForRolloutTest),
 		).
+		Watches(
+			&kuberikrolloutv1alpha1.Rollout{},
+			handler.EnqueueRequestsFromMapFunc(r.findKruiseRolloutsForKuberikRollout),
+		).
 		Complete(r)
 }
 
@@ -963,4 +967,74 @@ func (r *RolloutStepGateReconciler) findRolloutsForRolloutTest(ctx context.Conte
 			},
 		},
 	}
+}
+
+// findKruiseRolloutsForKuberikRollout finds Kruise Rollouts that should be reconciled when a Kuberik Rollout changes
+func (r *RolloutStepGateReconciler) findKruiseRolloutsForKuberikRollout(ctx context.Context, o client.Object) []reconcile.Request {
+	log := logf.FromContext(ctx)
+	kuberikRollout := o.(*kuberikrolloutv1alpha1.Rollout)
+
+	// List all Kruise Rollouts that might reference this Kuberik Rollout
+	var kruiseRollouts kruiserolloutv1beta1.RolloutList
+	if err := r.List(ctx, &kruiseRollouts); err != nil {
+		log.Error(err, "failed to list Kruise Rollouts")
+		return []reconcile.Request{}
+	}
+
+	var requests []reconcile.Request
+
+	// Check each Kruise Rollout to see if it references this Kuberik Rollout
+	for _, kruiseRollout := range kruiseRollouts.Items {
+		// Skip if not deployed by kustomize
+		kustomizeName := kruiseRollout.Annotations["kustomize.toolkit.fluxcd.io/name"]
+		if kustomizeName == "" {
+			kustomizeName = kruiseRollout.Labels["kustomize.toolkit.fluxcd.io/name"]
+		}
+		kustomizeNamespace := kruiseRollout.Annotations["kustomize.toolkit.fluxcd.io/namespace"]
+		if kustomizeNamespace == "" {
+			kustomizeNamespace = kruiseRollout.Labels["kustomize.toolkit.fluxcd.io/namespace"]
+		}
+
+		if kustomizeName == "" || kustomizeNamespace == "" {
+			continue
+		}
+
+		// Get the Kustomization
+		var kustomization kustomizev1.Kustomization
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      kustomizeName,
+			Namespace: kustomizeNamespace,
+		}, &kustomization); err != nil {
+			continue
+		}
+
+		// Use existing logic to find the Kuberik Rollout for this Kustomization
+		foundKuberikRollout, err := r.findKuberikRolloutForKustomization(ctx, &kustomization)
+		if err != nil {
+			log.V(5).Info("Error finding Kuberik Rollout for Kustomization",
+				"kustomization", kustomizeName,
+				"namespace", kustomizeNamespace,
+				"error", err)
+			continue
+		}
+
+		// If this Kustomization references the Kuberik Rollout that changed, queue reconciliation
+		if foundKuberikRollout != nil &&
+			foundKuberikRollout.Name == kuberikRollout.Name &&
+			foundKuberikRollout.Namespace == kuberikRollout.Namespace {
+			log.V(5).Info("Queuing Kruise Rollout for reconciliation due to Kuberik Rollout change",
+				"kruiseRollout", kruiseRollout.Name,
+				"kruiseRolloutNamespace", kruiseRollout.Namespace,
+				"kuberikRollout", kuberikRollout.Name,
+				"kuberikRolloutNamespace", kuberikRollout.Namespace)
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      kruiseRollout.Name,
+					Namespace: kruiseRollout.Namespace,
+				},
+			})
+		}
+	}
+
+	return requests
 }
