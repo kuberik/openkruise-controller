@@ -1000,6 +1000,13 @@ var _ = Describe("RolloutTest Controller", func() {
 				failedCondition := meta.FindStatusCondition(rt.Status.Conditions, "Failed")
 				Expect(failedCondition).NotTo(BeNil())
 				Expect(failedCondition.Status).To(Equal(metav1.ConditionTrue))
+
+				By("Verifying Ready condition is True")
+				readyCondition := meta.FindStatusCondition(rt.Status.Conditions, "Ready")
+				Expect(readyCondition).NotTo(BeNil())
+				Expect(readyCondition.Status).To(Equal(metav1.ConditionTrue))
+				Expect(readyCondition.Reason).To(Equal("StepAdvanced"))
+				Expect(readyCondition.Message).To(ContainSubstring("test result is final"))
 			})
 		})
 

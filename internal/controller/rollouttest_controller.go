@@ -173,6 +173,14 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				stalledCondition := meta.FindStatusCondition(rolloutTest.Status.Conditions, "Stalled")
 				if stalledCondition != nil && stalledCondition.Status == metav1.ConditionTrue {
 					meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+						Type:               "Ready",
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: rolloutTest.Generation,
+						Reason:             "StepAdvanced",
+						Message:            "Step moved forward, test result is final",
+						LastTransitionTime: metav1.Now(),
+					})
+					meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
 						Type:               "Stalled",
 						Status:             metav1.ConditionFalse,
 						ObservedGeneration: rolloutTest.Generation,
@@ -239,6 +247,14 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				"currentStep", rollout.Status.CurrentStepIndex,
 				"testStep", rolloutTest.Spec.StepIndex,
 				"phase", rolloutTest.Status.Phase)
+			meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: rolloutTest.Generation,
+				Reason:             "StepAdvanced",
+				Message:            "Step moved forward, test result is final",
+				LastTransitionTime: metav1.Now(),
+			})
 			meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
 				Type:               "Stalled",
 				Status:             metav1.ConditionFalse,
