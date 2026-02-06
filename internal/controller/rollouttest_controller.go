@@ -248,7 +248,10 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// If stalled due to TestFailed, ignore and allow retry/creation (don't mark as Cancelled)
 		if isStalled && stallReason != "RolloutTestFailed" {
 			log.Info("Rollout is stalled, not creating Job", "step", rolloutTest.Spec.StepIndex)
-			if rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseCancelled {
+			// Only cancel if not already in a terminal state (Succeeded, Failed, or Cancelled)
+			if rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseCancelled &&
+				rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseSucceeded &&
+				rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseFailed {
 				rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseCancelled
 				rolloutTest.Status.JobName = ""
 
