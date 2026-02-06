@@ -167,9 +167,26 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					log.Error(err, "failed to update status after job cancellation")
 					return ctrl.Result{}, err
 				}
+			} else {
+				// Test is in terminal state (Succeeded/Failed), preserve phase but clear Stalled condition
+				// The step has moved forward, so the test is no longer blocking progress
+				stalledCondition := meta.FindStatusCondition(rolloutTest.Status.Conditions, "Stalled")
+				if stalledCondition != nil && stalledCondition.Status == metav1.ConditionTrue {
+					meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+						Type:               "Stalled",
+						Status:             metav1.ConditionFalse,
+						ObservedGeneration: rolloutTest.Generation,
+						Reason:             "StepAdvanced",
+						Message:            "Step moved forward, test is no longer blocking progress",
+						LastTransitionTime: metav1.Now(),
+					})
+					if err := r.Status().Update(ctx, &rolloutTest); err != nil {
+						log.Error(err, "failed to clear Stalled condition after step advance")
+						return ctrl.Result{}, err
+					}
+				}
 			}
-			// If test already succeeded or failed, leave status unchanged
-			// It will be reset when new canary revision is observed
+			// Test results will be reset when new canary revision is observed
 			return ctrl.Result{}, nil
 		}
 
