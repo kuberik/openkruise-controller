@@ -896,6 +896,111 @@ var _ = Describe("RolloutTest Controller", func() {
 				// JobName should still be set (preserved from previous status)
 				Expect(rt.Status.JobName).To(Equal(job.Name))
 			})
+
+			It("should clear Stalled condition when step advances past failed test", func() {
+				ctx := context.Background()
+				controllerReconciler := &RolloutTestReconciler{
+					Client: k8sClient,
+					Scheme: k8sClient.Scheme(),
+				}
+
+				By("Setting up rollout at step 1, paused")
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+				if rollout.Status.CanaryStatus == nil {
+					rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+				}
+				rollout.Status.CurrentStepIndex = 1
+				rollout.Status.CanaryStatus.CanaryRevision = "v1"
+				rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+				By("Reconciling to create the job")
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				Expect(err).NotTo(HaveOccurred())
+
+				By("Getting the created job")
+				var jobs batchv1.JobList
+				Expect(k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": resourceName})).To(Succeed())
+				Expect(jobs.Items).To(HaveLen(1))
+				job := jobs.Items[0]
+
+				By("Setting job to failed state")
+				now := metav1.Now()
+				job.Status.Failed = 2
+				job.Status.Active = 0
+				job.Status.StartTime = &now
+				job.Status.Conditions = []batchv1.JobCondition{
+					{
+						Type:               batchv1.JobFailureTarget,
+						Status:             corev1.ConditionTrue,
+						LastProbeTime:      now,
+						LastTransitionTime: now,
+						Reason:             "BackoffLimitExceeded",
+						Message:            "Job has reached the specified backoff limit",
+					},
+					{
+						Type:               batchv1.JobFailed,
+						Status:             corev1.ConditionTrue,
+						LastProbeTime:      now,
+						LastTransitionTime: now,
+						Reason:             "BackoffLimitExceeded",
+						Message:            "Job has reached the specified backoff limit",
+					},
+				}
+				Expect(k8sClient.Status().Update(ctx, &job)).To(Succeed())
+
+				By("Reconciling to update status to Failed")
+				_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				Expect(err).NotTo(HaveOccurred())
+
+				By("Verifying RolloutTest is in Failed phase with Stalled condition")
+				var rt rolloutv1alpha1.RolloutTest
+				Expect(k8sClient.Get(ctx, typeNamespacedName, &rt)).To(Succeed())
+				Expect(rt.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseFailed))
+
+				stalledCondition := meta.FindStatusCondition(rt.Status.Conditions, "Stalled")
+				Expect(stalledCondition).NotTo(BeNil())
+				Expect(stalledCondition.Status).To(Equal(metav1.ConditionTrue))
+
+				By("Manually approving step by moving to step 2")
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+				rollout.Status.CurrentStepIndex = 2
+				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+				By("Reconciling - should preserve Failed phase but clear Stalled condition")
+				_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				Expect(err).NotTo(HaveOccurred())
+
+				By("Verifying job was deleted")
+				for i := 0; i < 10; i++ {
+					var deletedJob batchv1.Job
+					err = k8sClient.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: namespace}, &deletedJob)
+					if errors.IsNotFound(err) {
+						break
+					}
+					if !deletedJob.DeletionTimestamp.IsZero() && len(deletedJob.Finalizers) > 0 {
+						deletedJob.Finalizers = []string{}
+						_ = k8sClient.Update(ctx, &deletedJob)
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+
+				By("Verifying RolloutTest phase is preserved as Failed")
+				Expect(k8sClient.Get(ctx, typeNamespacedName, &rt)).To(Succeed())
+				Expect(rt.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseFailed))
+
+				By("Verifying Stalled condition is now False with reason StepAdvanced")
+				stalledCondition = meta.FindStatusCondition(rt.Status.Conditions, "Stalled")
+				Expect(stalledCondition).NotTo(BeNil())
+				Expect(stalledCondition.Status).To(Equal(metav1.ConditionFalse))
+				Expect(stalledCondition.Reason).To(Equal("StepAdvanced"))
+				Expect(stalledCondition.Message).To(ContainSubstring("Step moved forward"))
+
+				By("Verifying Failed condition remains True")
+				failedCondition := meta.FindStatusCondition(rt.Status.Conditions, "Failed")
+				Expect(failedCondition).NotTo(BeNil())
+				Expect(failedCondition.Status).To(Equal(metav1.ConditionTrue))
+			})
 		})
 
 		Context("When new canary is observed", func() {

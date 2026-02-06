@@ -229,7 +229,32 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// If Job does not exist, check if we should create one
-	// First check if the canary revision has changed - if so, reset status
+	// First, if step has moved forward and test is in terminal state with Stalled=True, clear Stalled
+	if rollout.Status.CurrentStepIndex != rolloutTest.Spec.StepIndex &&
+		(rolloutTest.Status.Phase == rolloutv1alpha1.RolloutTestPhaseSucceeded ||
+			rolloutTest.Status.Phase == rolloutv1alpha1.RolloutTestPhaseFailed) {
+		stalledCondition := meta.FindStatusCondition(rolloutTest.Status.Conditions, "Stalled")
+		if stalledCondition != nil && stalledCondition.Status == metav1.ConditionTrue {
+			log.Info("Step advanced past terminal test, clearing Stalled condition",
+				"currentStep", rollout.Status.CurrentStepIndex,
+				"testStep", rolloutTest.Spec.StepIndex,
+				"phase", rolloutTest.Status.Phase)
+			meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
+				Type:               "Stalled",
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: rolloutTest.Generation,
+				Reason:             "StepAdvanced",
+				Message:            "Step moved forward, test is no longer blocking progress",
+				LastTransitionTime: metav1.Now(),
+			})
+			if err := r.Status().Update(ctx, &rolloutTest); err != nil {
+				log.Error(err, "failed to clear Stalled condition after step advance (no job)")
+				return ctrl.Result{}, err
+			}
+		}
+	}
+
+	// Now check if the canary revision has changed - if so, reset status
 	currentRevision := ""
 	if rollout.Status.CanaryStatus != nil {
 		currentRevision = rollout.Status.CanaryStatus.CanaryRevision
