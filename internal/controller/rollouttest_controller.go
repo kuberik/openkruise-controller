@@ -303,9 +303,9 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if rollout.Status.CurrentStepIndex == rolloutTest.Spec.StepIndex {
 		// Check if rollout is stalled
 		isStalled, stallReason := r.isRolloutStalled(&rollout)
-		// If stalled due to TestFailed, ignore and allow retry/creation (don't mark as Cancelled)
-		if isStalled && stallReason != "RolloutTestFailed" {
-			log.Info("Rollout is stalled, not creating Job", "step", rolloutTest.Spec.StepIndex)
+		// If stalled for any reason, don't create new jobs
+		if isStalled {
+			log.Info("Rollout is stalled, not creating Job", "step", rolloutTest.Spec.StepIndex, "reason", stallReason)
 			// Only cancel if not already in a terminal state (Succeeded, Failed, or Cancelled)
 			if rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseCancelled &&
 				rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseSucceeded &&
@@ -344,6 +344,12 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					return ctrl.Result{}, err
 				}
 			}
+			return ctrl.Result{}, nil
+		}
+		// Don't auto-retry if test already failed - wait for user to continue rollout
+		// This prevents a race where the rolloutstepgate hasn't set Stalled yet on the Kruise rollout
+		if rolloutTest.Status.Phase == rolloutv1alpha1.RolloutTestPhaseFailed {
+			log.Info("Test already failed, waiting for manual intervention", "step", rolloutTest.Spec.StepIndex)
 			return ctrl.Result{}, nil
 		}
 		// Check if canary is in paused state before creating the job
