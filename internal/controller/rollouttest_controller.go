@@ -120,7 +120,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				_, _ = r.updateStatus(ctx, &rolloutTest, job, currentRevision)
 			}
 
-			if err := r.Delete(ctx, job); err != nil && !errors.IsNotFound(err) {
+			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !errors.IsNotFound(err) {
 				log.Error(err, "failed to delete job")
 				return ctrl.Result{}, err
 			}
@@ -207,7 +207,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			log.Info("Rollout canaryRevision changed, deleting old job",
 				"oldRevision", jobRevision,
 				"newRevision", rollout.Status.CanaryStatus.CanaryRevision)
-			if err := r.Delete(ctx, job); err != nil && !errors.IsNotFound(err) {
+			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !errors.IsNotFound(err) {
 				log.Error(err, "failed to delete old job")
 				return ctrl.Result{}, err
 			}
