@@ -866,6 +866,121 @@ var _ = Describe("RolloutStepGate Controller", func() {
 		})
 	})
 
+	Context("When step has no associated rollout tests", func() {
+		var namespace string
+		var rollout *kruiserolloutv1beta1.Rollout
+
+		BeforeEach(func() {
+			ctx := context.Background()
+
+			By("creating a unique namespace for the test")
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					GenerateName: "test-ns-",
+				},
+			}
+			Expect(k8sClient.Create(ctx, ns)).To(Succeed())
+			namespace = ns.Name
+
+			By("creating the Rollout with step-bake-time annotation and no RolloutTests")
+			rollout = &kruiserolloutv1beta1.Rollout{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-rollout-no-tests",
+					Namespace: namespace,
+					Annotations: map[string]string{
+						"rollout.kuberik.io/step-1-bake-time": "1m",
+					},
+				},
+				Spec: kruiserolloutv1beta1.RolloutSpec{
+					Strategy: kruiserolloutv1beta1.RolloutStrategy{
+						Canary: &kruiserolloutv1beta1.CanaryStrategy{
+							Steps: []kruiserolloutv1beta1.CanaryStep{
+								{
+									Replicas: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+									Pause: kruiserolloutv1beta1.RolloutPause{
+										Duration: func() *int32 { d := int32(3600); return &d }(),
+									},
+								},
+							},
+						},
+					},
+					WorkloadRef: kruiserolloutv1beta1.ObjectRef{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       "test-deployment",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, rollout)).To(Succeed())
+
+			By("setting rollout status to step 1 paused")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout-no-tests", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Status.CanaryStatus == nil {
+				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+			}
+			rollout.Status.CanaryStatus.CurrentStepIndex = 1
+			rollout.Status.CanaryStatus.CanaryRevision = "v1"
+			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			ctx := context.Background()
+			By("Cleaning up the test namespace")
+			ns := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: namespace,
+				},
+			}
+			Expect(k8sClient.Delete(ctx, ns)).To(Succeed())
+		})
+
+		It("should wait for step-bake-time and then auto-approve", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Reconciling for the first time - should mark ready and wait for bake-time")
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-rollout-no-tests",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 30*time.Second), "should requeue near bake-time when no tests are configured")
+
+			By("Verifying step-ready annotation is set and rollout is still paused")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout-no-tests", Namespace: namespace}, rollout)).To(Succeed())
+			readyAt, exists := rollout.Annotations["internal.rollout.kuberik.io/step-1-ready-at"]
+			Expect(exists).To(BeTrue(), "ready-at annotation should be set when step has no associated tests")
+			Expect(readyAt).NotTo(BeEmpty())
+			Expect(rollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).NotTo(BeNil())
+			Expect(*rollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).To(BeNumerically(">", 0), "step should stay paused until bake-time elapses")
+
+			By("Setting ready-at in the past so bake-time is elapsed")
+			pastReadyAt := time.Now().Add(-2 * time.Minute).Format(time.RFC3339)
+			rollout.Annotations["internal.rollout.kuberik.io/step-1-ready-at"] = pastReadyAt
+			Expect(k8sClient.Update(ctx, rollout)).To(Succeed())
+
+			By("Reconciling again - should auto-approve and unpause the step")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-rollout-no-tests",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying step was unpaused")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout-no-tests", Namespace: namespace}, rollout)).To(Succeed())
+			Expect(rollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).NotTo(BeNil())
+			Expect(*rollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).To(Equal(int32(0)))
+		})
+	})
+
 	Context("When kuberik Rollout bake status is checked", func() {
 		var namespace string
 		var kruiseRollout *kruiserolloutv1beta1.Rollout

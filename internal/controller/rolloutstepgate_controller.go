@@ -246,8 +246,18 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
-	// Evaluate test status
-	allPassed, anyFailedTests, failedTestName := r.evaluateTests(relevantTests)
+	// Evaluate test status.
+	// If no RolloutTests exist for this step and a positive step-bake-time is configured,
+	// treat tests as implicitly passed so bake-time can still gate auto-approval.
+	// Without bake-time, preserve the existing behavior of waiting for tests.
+	allPassed := false
+	anyFailedTests := false
+	failedTestName := ""
+	if len(tests) == 0 {
+		allPassed = bakeTime > 0
+	} else {
+		allPassed, anyFailedTests, failedTestName = r.evaluateTests(relevantTests)
+	}
 	anyFailed := anyFailedTests || bakeFailed
 
 	now := time.Now()
