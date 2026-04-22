@@ -15,4 +15,4 @@ directories:
       url: https://raw.githubusercontent.com/fluxcd/source-controller/refs/tags/v1.7.4/config/crd/bases/source.toolkit.fluxcd.io_ocirepositories.yaml
   - path: kuberik.com_rollouts.yaml
     http:
-      url: https://raw.githubusercontent.com/kuberik/rollout-controller/refs/tags/v0.5.0/config/crd/bases/kuberik.com_rollouts.yaml
+      url: https://raw.githubusercontent.com/kuberik/rollout-controller/318193bc22727a7954b00fa88a07bce4f1bc79f7/config/crd/bases/kuberik.com_rollouts.yaml

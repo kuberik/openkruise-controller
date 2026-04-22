@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/fluxcd/kustomize-controller/api v1.7.3
 	github.com/fluxcd/source-controller/api v1.7.4
-	github.com/kuberik/rollout-controller v0.5.0
+	github.com/kuberik/rollout-controller v0.7.1-0.20260422075118-318193bc2272
 	github.com/onsi/ginkgo/v2 v2.22.0
 	github.com/onsi/gomega v1.36.1
 	github.com/openkruise/kruise-rollout-api v0.6.0

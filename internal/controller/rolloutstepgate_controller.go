@@ -23,7 +23,10 @@ import (
 	"strings"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -123,6 +126,40 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		// Non-fatal, continue with normal flow
 	}
 	log.V(1).Info("Bake status check", "bakeFailed", bakeFailed, "message", bakeMessage)
+
+	// Determine retry cutoff from the matching kuberik Rollout. If a retry was
+	// requested more recently than the Stalled condition was set, unwind the
+	// stalled state: reset failed RolloutTests for the current step, then clear
+	// the Stalled condition. Tests whose Failed condition transitioned before the
+	// cutoff are treated as pending by evaluateTests (see below) to prevent
+	// immediate re-stall during the reset window.
+	retryCutoff, err := r.getKuberikRetryCutoff(ctx, &rollout)
+	if err != nil {
+		log.Error(err, "failed to fetch kuberik rollout retry timestamp")
+		// Non-fatal, continue
+	}
+	if retryCutoff != nil && r.stalledBefore(&rollout, retryCutoff) {
+		log.Info("Retry detected, resetting failed RolloutTests and clearing Stalled",
+			"retryCutoff", retryCutoff.Format(time.RFC3339))
+		if err := r.resetFailedTestsForStep(ctx, rollout.Namespace, rollout.Name, currentStepIndex, retryCutoff); err != nil {
+			log.Error(err, "failed to reset failed RolloutTests during retry")
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+		}
+		if r.clearStalledCondition(&rollout) {
+			if err := r.Status().Update(ctx, &rollout); err != nil {
+				log.Error(err, "failed to clear Stalled condition during retry")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+			}
+		}
+		// Re-evaluate bake failure: after the retry the kuberik rollout should
+		// have moved out of Failed, so bakeFailed is likely false now.
+		bakeFailed = false
+		bakeMessage = ""
+		// Refetch to get a clean status view for the remainder of the reconcile.
+		if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 
 	// Handle revision annotation updates
 	if lastRevisionStr != "" && lastRevisionStr != currentRevision {
@@ -256,7 +293,7 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if len(tests) == 0 {
 		allPassed = bakeTime > 0
 	} else {
-		allPassed, anyFailedTests, failedTestName = r.evaluateTests(relevantTests)
+		allPassed, anyFailedTests, failedTestName = r.evaluateTests(relevantTests, retryCutoff)
 	}
 	anyFailed := anyFailedTests || bakeFailed
 
@@ -580,9 +617,13 @@ func (r *RolloutStepGateReconciler) getRolloutTestsForStep(ctx context.Context, 
 	return result, nil
 }
 
-// evaluateTests checks the status of all tests
+// evaluateTests checks the status of all tests.
 // Returns: (allPassed, anyFailed, failedTestName)
-func (r *RolloutStepGateReconciler) evaluateTests(tests []rolloutv1alpha1.RolloutTest) (bool, bool, string) {
+// When retryCutoff is non-nil, a Failed/Cancelled test whose Failed condition
+// transitioned before the cutoff is treated as still in progress. This prevents
+// RolloutStepGate from re-stalling on stale pre-retry failures during the brief
+// window between the retry request and the eventual RolloutTest reset.
+func (r *RolloutStepGateReconciler) evaluateTests(tests []rolloutv1alpha1.RolloutTest, retryCutoff *metav1.Time) (bool, bool, string) {
 	if len(tests) == 0 {
 		// No tests means we can't approve yet - wait for tests to be created
 		return false, false, ""
@@ -598,6 +639,12 @@ func (r *RolloutStepGateReconciler) evaluateTests(tests []rolloutv1alpha1.Rollou
 		// This avoids race conditions with partial condition updates
 		switch test.Status.Phase {
 		case rolloutv1alpha1.RolloutTestPhaseFailed, rolloutv1alpha1.RolloutTestPhaseCancelled:
+			if isStaleFailedTest(&test, retryCutoff) {
+				// Failure predates the retry; wait for the eventual reset.
+				anyInProgress = true
+				allPassed = false
+				continue
+			}
 			// Failed or Cancelled = test failed
 			anyFailed = true
 			allPassed = false
@@ -690,6 +737,129 @@ func (r *RolloutStepGateReconciler) clearStalledCondition(rollout *kruiserollout
 	}
 
 	return true
+}
+
+// getKuberikRetryCutoff returns the LastRetryTimestamp from the kuberik Rollout
+// linked to this Kruise Rollout via Kustomization, or nil when absent.
+func (r *RolloutStepGateReconciler) getKuberikRetryCutoff(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) (*metav1.Time, error) {
+	kuberikRollout, err := r.findKuberikRollout(ctx, rollout)
+	if err != nil || kuberikRollout == nil {
+		return nil, err
+	}
+	if len(kuberikRollout.Status.History) == 0 {
+		return nil, nil
+	}
+	return kuberikRollout.Status.History[0].LastRetryTimestamp, nil
+}
+
+// findKuberikRollout resolves the kuberik Rollout associated with the given
+// Kruise Rollout via its Kustomization. Returns (nil, nil) when the linkage is
+// missing — this is a normal, non-error outcome.
+func (r *RolloutStepGateReconciler) findKuberikRollout(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) (*kuberikrolloutv1alpha1.Rollout, error) {
+	kustomizeName := rollout.Annotations["kustomize.toolkit.fluxcd.io/name"]
+	if kustomizeName == "" {
+		kustomizeName = rollout.Labels["kustomize.toolkit.fluxcd.io/name"]
+	}
+	kustomizeNamespace := rollout.Annotations["kustomize.toolkit.fluxcd.io/namespace"]
+	if kustomizeNamespace == "" {
+		kustomizeNamespace = rollout.Labels["kustomize.toolkit.fluxcd.io/namespace"]
+	}
+	if kustomizeName == "" || kustomizeNamespace == "" {
+		return nil, nil
+	}
+	var kustomization kustomizev1.Kustomization
+	if err := r.Get(ctx, types.NamespacedName{Name: kustomizeName, Namespace: kustomizeNamespace}, &kustomization); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return r.findKuberikRolloutForKustomization(ctx, &kustomization)
+}
+
+// stalledBefore reports whether the Kruise Rollout currently has a Stalled=True
+// condition whose LastTransitionTime is strictly before the given cutoff. This
+// is the signal that a retry postdates the stall and we should unwind it.
+func (r *RolloutStepGateReconciler) stalledBefore(rollout *kruiserolloutv1beta1.Rollout, cutoff *metav1.Time) bool {
+	if cutoff == nil {
+		return false
+	}
+	for _, c := range rollout.Status.Conditions {
+		if c.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") && c.Status == corev1.ConditionTrue {
+			return c.LastTransitionTime.Time.Before(cutoff.Time)
+		}
+	}
+	return false
+}
+
+// resetFailedTestsForStep resets any RolloutTest belonging to the given step
+// whose Failed condition transitioned before retryCutoff — deleting its Job and
+// clearing its Phase/conditions so a fresh job is created on the next reconcile.
+// Tests that are Succeeded, or failed after the cutoff (fresh failures), are
+// left untouched.
+func (r *RolloutStepGateReconciler) resetFailedTestsForStep(ctx context.Context, namespace, rolloutName string, stepIndex int32, retryCutoff *metav1.Time) error {
+	log := logf.FromContext(ctx)
+	tests, err := r.getRolloutTestsForStep(ctx, namespace, rolloutName, stepIndex)
+	if err != nil {
+		return err
+	}
+	for i := range tests {
+		test := &tests[i]
+		if !isStaleFailedTest(test, retryCutoff) {
+			continue
+		}
+
+		// Delete the owned Job so a new one is created on next reconcile.
+		var jobs batchv1.JobList
+		if err := r.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": test.Name}); err != nil {
+			return err
+		}
+		for j := range jobs.Items {
+			if err := r.Delete(ctx, &jobs.Items[j], client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+		}
+
+		// Reset the RolloutTest status to WaitingForStep; the RolloutTest
+		// reconciler will then (once the Stalled condition is cleared) create a
+		// new Job when the step is reached and the canary is paused.
+		test.Status.Phase = rolloutv1alpha1.RolloutTestPhaseWaitingForStep
+		test.Status.JobName = ""
+		test.Status.RetryCount = 0
+		test.Status.ActivePods = 0
+		test.Status.SucceededPods = 0
+		test.Status.FailedPods = 0
+		test.Status.ObservedCanaryRevision = ""
+		test.Status.Conditions = nil
+		if err := r.Status().Update(ctx, test); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+		log.Info("Reset stale RolloutTest for retry", "test", test.Name, "step", stepIndex)
+	}
+	return nil
+}
+
+// isStaleFailedTest returns true when the test is in Failed/Cancelled phase and
+// its Failed condition (or Ready condition as a fallback) transitioned strictly
+// before retryCutoff. When retryCutoff is nil, no failure is considered stale.
+func isStaleFailedTest(test *rolloutv1alpha1.RolloutTest, retryCutoff *metav1.Time) bool {
+	if retryCutoff == nil {
+		return false
+	}
+	if test.Status.Phase != rolloutv1alpha1.RolloutTestPhaseFailed &&
+		test.Status.Phase != rolloutv1alpha1.RolloutTestPhaseCancelled {
+		return false
+	}
+	cond := meta.FindStatusCondition(test.Status.Conditions, "Failed")
+	if cond == nil {
+		cond = meta.FindStatusCondition(test.Status.Conditions, "Ready")
+	}
+	if cond == nil {
+		// No condition to anchor transition time; be conservative and treat
+		// as fresh so we don't silently drop a real failure.
+		return false
+	}
+	return cond.LastTransitionTime.Time.Before(retryCutoff.Time)
 }
 
 // getBakeFailureStatus checks if the rollout was deployed by kustomize and if the

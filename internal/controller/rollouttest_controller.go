@@ -306,10 +306,13 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// If stalled for any reason, don't create new jobs
 		if isStalled {
 			log.Info("Rollout is stalled, not creating Job", "step", rolloutTest.Spec.StepIndex, "reason", stallReason)
-			// Only cancel if not already in a terminal state (Succeeded, Failed, or Cancelled)
+			// Only cancel active (Pending/Running) tests. WaitingForStep is the
+			// parked state the stepgate uses to signal a retry reset — cancelling
+			// it here would race with that reset and lose the re-run.
 			if rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseCancelled &&
 				rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseSucceeded &&
-				rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseFailed {
+				rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseFailed &&
+				rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseWaitingForStep {
 				rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseCancelled
 				rolloutTest.Status.JobName = ""
 
