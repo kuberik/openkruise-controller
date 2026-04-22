@@ -862,10 +862,17 @@ func (r *RolloutStepGateReconciler) resetStepDeadlineForRetry(ctx context.Contex
 
 // resetFailedTestsForStep handles stale-failed RolloutTests for the given step.
 // Behavior depends on retryMode:
-//   "skip": mark the test as Skipped (treated as passing). The failed Job is kept
-//           for audit; Conditions reflect the skip decision.
-//   otherwise (retry): reset phase to WaitingForStep and delete the owned Job so a
-//           fresh job is created on next reconcile.
+//   "skip": mark the test as Skipped (treated as passing).
+//   otherwise (retry): reset phase to WaitingForStep so a fresh job is created on
+//           next reconcile.
+//
+// Both modes delete the owned Job: keeping a stale Job around allows
+// RolloutTestReconciler.updateStatus to later overwrite our Phase patch with a
+// phase derived from the Job's state (e.g. Skipped → Failed when the old job's
+// retries finally exhaust). The previous-attempt's outcome is already captured
+// on Kubernetes Events and the Kuberik Rollout history — we don't need the Job
+// object itself as an audit trail.
+//
 // Tests that are Succeeded, or failed after the cutoff (fresh failures), are
 // left untouched regardless of mode.
 func (r *RolloutStepGateReconciler) resetFailedTestsForStep(ctx context.Context, namespace, rolloutName string, stepIndex int32, retryCutoff *metav1.Time, retryMode string) error {
@@ -881,8 +888,22 @@ func (r *RolloutStepGateReconciler) resetFailedTestsForStep(ctx context.Context,
 			continue
 		}
 
+		// Delete the owned Job in both modes. In retry mode a fresh Job needs
+		// to be created; in skip mode the old Job's status would otherwise be
+		// re-synced onto the RolloutTest by updateStatus, clobbering Skipped.
+		var jobs batchv1.JobList
+		if err := r.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": test.Name}); err != nil {
+			return err
+		}
+		for j := range jobs.Items {
+			if err := r.Delete(ctx, &jobs.Items[j], client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+		}
+
 		if skipMode {
 			test.Status.Phase = rolloutv1alpha1.RolloutTestPhaseSkipped
+			test.Status.JobName = ""
 			now := metav1.Now()
 			msg := "Test skipped via retry annotation (mode=skip)"
 			meta.SetStatusCondition(&test.Status.Conditions, metav1.Condition{
@@ -901,22 +922,19 @@ func (r *RolloutStepGateReconciler) resetFailedTestsForStep(ctx context.Context,
 				Message:            msg,
 				LastTransitionTime: now,
 			})
+			meta.SetStatusCondition(&test.Status.Conditions, metav1.Condition{
+				Type:               "Stalled",
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: test.Generation,
+				Reason:             "TestSkipped",
+				Message:            msg,
+				LastTransitionTime: now,
+			})
 			if err := r.Status().Update(ctx, test); err != nil && !apierrors.IsNotFound(err) {
 				return err
 			}
 			log.Info("Marked stale RolloutTest as Skipped", "test", test.Name, "step", stepIndex)
 			continue
-		}
-
-		// retry mode: delete the owned Job and reset phase so a new job is created.
-		var jobs batchv1.JobList
-		if err := r.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": test.Name}); err != nil {
-			return err
-		}
-		for j := range jobs.Items {
-			if err := r.Delete(ctx, &jobs.Items[j], client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
-				return err
-			}
 		}
 
 		test.Status.Phase = rolloutv1alpha1.RolloutTestPhaseWaitingForStep

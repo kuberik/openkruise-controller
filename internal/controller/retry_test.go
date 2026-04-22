@@ -383,7 +383,7 @@ var _ = Describe("RolloutStepGate retry handling", func() {
 		Expect(stalled.Status).To(Equal(corev1.ConditionFalse))
 	})
 
-	It("skip mode: marks stale-failed tests as Skipped and keeps the Job", func() {
+	It("skip mode: marks stale-failed tests as Skipped and deletes the Job", func() {
 		stallAt := time.Now().Add(-30 * time.Minute)
 		retryAt := time.Now().Add(-5 * time.Minute)
 
@@ -399,10 +399,12 @@ var _ = Describe("RolloutStepGate retry handling", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, updatedTest)).To(Succeed())
 		Expect(updatedTest.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseSkipped))
 
-		// Original failed Job is preserved (audit trail); retry mode would have deleted it.
+		// The owned Job is deleted in both modes: keeping it around lets the
+		// rollouttest controller's updateStatus re-sync the old job's state
+		// onto our Skipped patch (e.g. BackoffLimitExceeded → phase=Failed).
 		var jobs batchv1.JobList
 		Expect(k8sClient.List(ctx, &jobs, client.InNamespace(f.ns), client.MatchingLabels{"rollout-test": f.rolloutTest.Name})).To(Succeed())
-		Expect(jobs.Items).To(HaveLen(1))
+		Expect(jobs.Items).To(BeEmpty())
 
 		// Stalled condition cleared so the step can advance.
 		updated := &kruiserolloutv1beta1.Rollout{}
@@ -619,6 +621,130 @@ var _ = Describe("RolloutTest preserves WaitingForStep under stall", func() {
 		updated := &rolloutv1alpha1.RolloutTest{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rolloutTest.Name, Namespace: namespace}, updated)).To(Succeed())
 		Expect(updated.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseCancelled))
+	})
+})
+
+var _ = Describe("RolloutTest terminal-phase job-creation guard", func() {
+	ctx := context.Background()
+	var namespace string
+	var reconciler *RolloutTestReconciler
+	var kruiseRollout *kruiserolloutv1beta1.Rollout
+	var rolloutTest *rolloutv1alpha1.RolloutTest
+
+	// Rollout sits at step 1, unstalled, canary paused — the exact conditions
+	// where the "create Job" branch would fire if the terminal-phase guard
+	// didn't short-circuit first.
+	BeforeEach(func() {
+		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "term-guard-ns-"}}
+		Expect(k8sClient.Create(ctx, ns)).To(Succeed())
+		namespace = ns.Name
+
+		kruiseRollout = &kruiserolloutv1beta1.Rollout{
+			ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: namespace},
+			Spec: kruiserolloutv1beta1.RolloutSpec{
+				Strategy: kruiserolloutv1beta1.RolloutStrategy{
+					Canary: &kruiserolloutv1beta1.CanaryStrategy{
+						Steps: []kruiserolloutv1beta1.CanaryStep{{
+							Replicas: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+							Pause:    kruiserolloutv1beta1.RolloutPause{Duration: func() *int32 { d := int32(3600); return &d }()},
+						}},
+					},
+				},
+				WorkloadRef: kruiserolloutv1beta1.ObjectRef{APIVersion: "apps/v1", Kind: "Deployment", Name: "app-dep"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, kruiseRollout)).To(Succeed())
+		kruiseRollout.Status.CurrentStepIndex = 1
+		kruiseRollout.Status.CurrentStepState = "StepPaused"
+		kruiseRollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{CanaryRevision: "rev-1"}
+		kruiseRollout.Status.CanaryStatus.CurrentStepIndex = 1
+		kruiseRollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+		// Deliberately no Stalled condition — the guard under test is the
+		// terminal-phase one, not the stalled-reasons one.
+		Expect(k8sClient.Status().Update(ctx, kruiseRollout)).To(Succeed())
+
+		rolloutTest = &rolloutv1alpha1.RolloutTest{
+			ObjectMeta: metav1.ObjectMeta{Name: "app-test", Namespace: namespace},
+			Spec: rolloutv1alpha1.RolloutTestSpec{
+				RolloutName: "app",
+				StepIndex:   1,
+				JobTemplate: batchv1.JobSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers:    []corev1.Container{{Name: "c", Image: "busybox", Command: []string{"true"}}},
+							RestartPolicy: corev1.RestartPolicyNever,
+						},
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, rolloutTest)).To(Succeed())
+
+		reconciler = &RolloutTestReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	})
+
+	AfterEach(func() {
+		Expect(k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})).To(Succeed())
+	})
+
+	setPhaseAndReconcile := func(phase rolloutv1alpha1.RolloutTestPhase) {
+		GinkgoHelper()
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rolloutTest.Name, Namespace: namespace}, rolloutTest)).To(Succeed())
+		rolloutTest.Status.Phase = phase
+		rolloutTest.Status.ObservedCanaryRevision = "rev-1"
+		Expect(k8sClient.Status().Update(ctx, rolloutTest)).To(Succeed())
+
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: rolloutTest.Name, Namespace: namespace}})
+		Expect(err).NotTo(HaveOccurred())
+	}
+
+	It("does not create a Job when phase is Failed", func() {
+		setPhaseAndReconcile(rolloutv1alpha1.RolloutTestPhaseFailed)
+
+		var jobs batchv1.JobList
+		Expect(k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": rolloutTest.Name})).To(Succeed())
+		Expect(jobs.Items).To(BeEmpty())
+	})
+
+	It("does not create a Job when phase is Cancelled (prevents race with stepgate Skipped marking)", func() {
+		setPhaseAndReconcile(rolloutv1alpha1.RolloutTestPhaseCancelled)
+
+		var jobs batchv1.JobList
+		Expect(k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": rolloutTest.Name})).To(Succeed())
+		Expect(jobs.Items).To(BeEmpty())
+
+		// Phase stays Cancelled — no overwrite to Pending.
+		updated := &rolloutv1alpha1.RolloutTest{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rolloutTest.Name, Namespace: namespace}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseCancelled))
+	})
+
+	It("does not create a Job when phase is Skipped (skip-mode outcome must be sticky)", func() {
+		setPhaseAndReconcile(rolloutv1alpha1.RolloutTestPhaseSkipped)
+
+		var jobs batchv1.JobList
+		Expect(k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": rolloutTest.Name})).To(Succeed())
+		Expect(jobs.Items).To(BeEmpty())
+
+		updated := &rolloutv1alpha1.RolloutTest{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rolloutTest.Name, Namespace: namespace}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseSkipped))
+	})
+
+	It("does not create a Job when phase is Succeeded", func() {
+		setPhaseAndReconcile(rolloutv1alpha1.RolloutTestPhaseSucceeded)
+
+		var jobs batchv1.JobList
+		Expect(k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": rolloutTest.Name})).To(Succeed())
+		Expect(jobs.Items).To(BeEmpty())
+	})
+
+	It("DOES create a Job when phase is WaitingForStep (retry-mode reset path)", func() {
+		setPhaseAndReconcile(rolloutv1alpha1.RolloutTestPhaseWaitingForStep)
+
+		var jobs batchv1.JobList
+		Expect(k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": rolloutTest.Name})).To(Succeed())
+		Expect(jobs.Items).To(HaveLen(1), "WaitingForStep is the non-terminal retry reset — a fresh Job should be created")
 	})
 })
 

@@ -382,10 +382,20 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			}
 			return ctrl.Result{}, nil
 		}
-		// Don't auto-retry if test already failed - wait for user to continue rollout
-		// This prevents a race where the rolloutstepgate hasn't set Stalled yet on the Kruise rollout
-		if rolloutTest.Status.Phase == rolloutv1alpha1.RolloutTestPhaseFailed {
-			log.Info("Test already failed, waiting for manual intervention", "step", rolloutTest.Spec.StepIndex)
+		// Terminal phases don't auto-recreate jobs. Failed, Cancelled, Skipped,
+		// and Succeeded tests stay put until either (a) a retry via the Kuberik
+		// Rollout's retry annotation resets them to WaitingForStep / Skipped, or
+		// (b) a new canary revision is observed (handled above). Without this
+		// guard, stepgate's Skipped/reset patches race with a fresh job creation
+		// here — the controller sees the old Cancelled phase and creates a new
+		// job that eventually overwrites Skipped with Pending → Failed.
+		if rolloutTest.Status.Phase == rolloutv1alpha1.RolloutTestPhaseFailed ||
+			rolloutTest.Status.Phase == rolloutv1alpha1.RolloutTestPhaseCancelled ||
+			rolloutTest.Status.Phase == rolloutv1alpha1.RolloutTestPhaseSkipped ||
+			rolloutTest.Status.Phase == rolloutv1alpha1.RolloutTestPhaseSucceeded {
+			log.Info("Test is in a terminal phase, not creating new Job",
+				"step", rolloutTest.Spec.StepIndex,
+				"phase", rolloutTest.Status.Phase)
 			return ctrl.Result{}, nil
 		}
 		// Check if canary is in paused state before creating the job
