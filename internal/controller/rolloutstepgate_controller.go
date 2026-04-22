@@ -133,15 +133,16 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// the Stalled condition. Tests whose Failed condition transitioned before the
 	// cutoff are treated as pending by evaluateTests (see below) to prevent
 	// immediate re-stall during the reset window.
-	retryCutoff, err := r.getKuberikRetryCutoff(ctx, &rollout)
+	retryCutoff, retryMode, err := r.getKuberikRetryCutoff(ctx, &rollout)
 	if err != nil {
 		log.Error(err, "failed to fetch kuberik rollout retry timestamp")
 		// Non-fatal, continue
 	}
 	if retryCutoff != nil && r.stalledBefore(&rollout, retryCutoff) {
 		log.Info("Retry detected, resetting failed RolloutTests and clearing Stalled",
-			"retryCutoff", retryCutoff.Format(time.RFC3339))
-		if err := r.resetFailedTestsForStep(ctx, rollout.Namespace, rollout.Name, currentStepIndex, retryCutoff); err != nil {
+			"retryCutoff", retryCutoff.Format(time.RFC3339),
+			"mode", retryMode)
+		if err := r.resetFailedTestsForStep(ctx, rollout.Namespace, rollout.Name, currentStepIndex, retryCutoff, retryMode); err != nil {
 			log.Error(err, "failed to reset failed RolloutTests during retry")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 		}
@@ -651,8 +652,8 @@ func (r *RolloutStepGateReconciler) evaluateTests(tests []rolloutv1alpha1.Rollou
 			if failedTestName == "" {
 				failedTestName = test.Name
 			}
-		case rolloutv1alpha1.RolloutTestPhaseSucceeded:
-			// Test passed, continue to next test
+		case rolloutv1alpha1.RolloutTestPhaseSucceeded, rolloutv1alpha1.RolloutTestPhaseSkipped:
+			// Test passed (Skipped counts as passing — user intentionally bypassed it).
 		default:
 			// Running, Pending, WaitingForStep, or empty = still in progress
 			anyInProgress = true
@@ -739,17 +740,19 @@ func (r *RolloutStepGateReconciler) clearStalledCondition(rollout *kruiserollout
 	return true
 }
 
-// getKuberikRetryCutoff returns the LastRetryTimestamp from the kuberik Rollout
-// linked to this Kruise Rollout via Kustomization, or nil when absent.
-func (r *RolloutStepGateReconciler) getKuberikRetryCutoff(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) (*metav1.Time, error) {
+// getKuberikRetryCutoff returns the LastRetryTimestamp and mode from the kuberik Rollout
+// linked to this Kruise Rollout via Kustomization. cutoff is nil when no retry has been
+// recorded. mode is one of "retry" / "skip" (empty when cutoff is nil).
+func (r *RolloutStepGateReconciler) getKuberikRetryCutoff(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) (cutoff *metav1.Time, mode string, err error) {
 	kuberikRollout, err := r.findKuberikRollout(ctx, rollout)
 	if err != nil || kuberikRollout == nil {
-		return nil, err
+		return nil, "", err
 	}
 	if len(kuberikRollout.Status.History) == 0 {
-		return nil, nil
+		return nil, "", nil
 	}
-	return kuberikRollout.Status.History[0].LastRetryTimestamp, nil
+	entry := kuberikRollout.Status.History[0]
+	return entry.LastRetryTimestamp, entry.LastRetryMode, nil
 }
 
 // findKuberikRollout resolves the kuberik Rollout associated with the given
@@ -792,24 +795,55 @@ func (r *RolloutStepGateReconciler) stalledBefore(rollout *kruiserolloutv1beta1.
 	return false
 }
 
-// resetFailedTestsForStep resets any RolloutTest belonging to the given step
-// whose Failed condition transitioned before retryCutoff — deleting its Job and
-// clearing its Phase/conditions so a fresh job is created on the next reconcile.
+// resetFailedTestsForStep handles stale-failed RolloutTests for the given step.
+// Behavior depends on retryMode:
+//   "skip": mark the test as Skipped (treated as passing). The failed Job is kept
+//           for audit; Conditions reflect the skip decision.
+//   otherwise (retry): reset phase to WaitingForStep and delete the owned Job so a
+//           fresh job is created on next reconcile.
 // Tests that are Succeeded, or failed after the cutoff (fresh failures), are
-// left untouched.
-func (r *RolloutStepGateReconciler) resetFailedTestsForStep(ctx context.Context, namespace, rolloutName string, stepIndex int32, retryCutoff *metav1.Time) error {
+// left untouched regardless of mode.
+func (r *RolloutStepGateReconciler) resetFailedTestsForStep(ctx context.Context, namespace, rolloutName string, stepIndex int32, retryCutoff *metav1.Time, retryMode string) error {
 	log := logf.FromContext(ctx)
 	tests, err := r.getRolloutTestsForStep(ctx, namespace, rolloutName, stepIndex)
 	if err != nil {
 		return err
 	}
+	skipMode := retryMode == kuberikrolloutv1alpha1.RetryModeSkip
 	for i := range tests {
 		test := &tests[i]
 		if !isStaleFailedTest(test, retryCutoff) {
 			continue
 		}
 
-		// Delete the owned Job so a new one is created on next reconcile.
+		if skipMode {
+			test.Status.Phase = rolloutv1alpha1.RolloutTestPhaseSkipped
+			now := metav1.Now()
+			msg := "Test skipped via retry annotation (mode=skip)"
+			meta.SetStatusCondition(&test.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: test.Generation,
+				Reason:             "TestSkipped",
+				Message:            msg,
+				LastTransitionTime: now,
+			})
+			meta.SetStatusCondition(&test.Status.Conditions, metav1.Condition{
+				Type:               "Failed",
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: test.Generation,
+				Reason:             "TestSkipped",
+				Message:            msg,
+				LastTransitionTime: now,
+			})
+			if err := r.Status().Update(ctx, test); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+			log.Info("Marked stale RolloutTest as Skipped", "test", test.Name, "step", stepIndex)
+			continue
+		}
+
+		// retry mode: delete the owned Job and reset phase so a new job is created.
 		var jobs batchv1.JobList
 		if err := r.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": test.Name}); err != nil {
 			return err
@@ -820,9 +854,6 @@ func (r *RolloutStepGateReconciler) resetFailedTestsForStep(ctx context.Context,
 			}
 		}
 
-		// Reset the RolloutTest status to WaitingForStep; the RolloutTest
-		// reconciler will then (once the Stalled condition is cleared) create a
-		// new Job when the step is reached and the canary is paused.
 		test.Status.Phase = rolloutv1alpha1.RolloutTestPhaseWaitingForStep
 		test.Status.JobName = ""
 		test.Status.RetryCount = 0

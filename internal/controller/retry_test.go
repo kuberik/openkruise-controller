@@ -136,9 +136,10 @@ func (f *retryFixture) cleanup(ctx context.Context) {
 	Expect(k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: f.ns}})).To(Succeed())
 }
 
-// setKuberikRetry stamps LastRetryTimestamp on the kuberik Rollout's latest
-// history entry. retryAt is the simulated retry moment.
-func (f *retryFixture) setKuberikRetry(ctx context.Context, retryAt time.Time) {
+// setKuberikRetry stamps LastRetryTimestamp (and mode) on the kuberik Rollout's
+// latest history entry. retryAt is the simulated retry moment. mode is "retry" or
+// "skip" (empty treated as retry by downstream logic).
+func (f *retryFixture) setKuberikRetry(ctx context.Context, retryAt time.Time, mode string) {
 	GinkgoHelper()
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.kuberikRollout.Name, Namespace: f.ns}, f.kuberikRollout)).To(Succeed())
 	ts := metav1.NewTime(retryAt)
@@ -148,6 +149,7 @@ func (f *retryFixture) setKuberikRetry(ctx context.Context, retryAt time.Time) {
 		Timestamp:          metav1.NewTime(retryAt.Add(-30 * time.Minute)),
 		BakeStatus:         &deploying,
 		LastRetryTimestamp: &ts,
+		LastRetryMode:      mode,
 	}}
 	Expect(k8sClient.Status().Update(ctx, f.kuberikRollout)).To(Succeed())
 }
@@ -225,7 +227,7 @@ var _ = Describe("RolloutStepGate retry handling", func() {
 
 		f.setStalled(ctx, "RolloutTestFailed", stallAt)
 		f.setTestFailed(ctx, stallAt.Add(-1*time.Minute), true)
-		f.setKuberikRetry(ctx, retryAt)
+		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
 
 		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
 		Expect(err).NotTo(HaveOccurred())
@@ -258,7 +260,7 @@ var _ = Describe("RolloutStepGate retry handling", func() {
 
 		f.setStalled(ctx, "RolloutTestFailed", stallAt)
 		f.setTestFailed(ctx, stallAt, false)
-		f.setKuberikRetry(ctx, retryAt)
+		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
 
 		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
 		Expect(err).NotTo(HaveOccurred())
@@ -299,7 +301,7 @@ var _ = Describe("RolloutStepGate retry handling", func() {
 		retryAt := time.Now().Add(-2 * time.Minute)
 
 		f.setStalled(ctx, "KuberikRolloutBakeFailed", stallAt)
-		f.setKuberikRetry(ctx, retryAt)
+		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
 
 		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
 		Expect(err).NotTo(HaveOccurred())
@@ -322,7 +324,7 @@ var _ = Describe("RolloutStepGate retry handling", func() {
 
 		f.setStalled(ctx, "RolloutTestFailed", stallAt)
 		f.setTestFailed(ctx, stallAt.Add(-1*time.Minute), true)
-		f.setKuberikRetry(ctx, retryAt)
+		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
 
 		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
 		Expect(err).NotTo(HaveOccurred())
@@ -356,7 +358,7 @@ var _ = Describe("RolloutStepGate retry handling", func() {
 
 		f.setStalled(ctx, "RolloutTestFailed", stallAt)
 		f.setTestFailed(ctx, stallAt.Add(-1*time.Minute), false)
-		f.setKuberikRetry(ctx, retryAt)
+		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
 
 		for i := 0; i < 3; i++ {
 			_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
@@ -373,6 +375,63 @@ var _ = Describe("RolloutStepGate retry handling", func() {
 		}
 		Expect(stalled).NotTo(BeNil())
 		Expect(stalled.Status).To(Equal(corev1.ConditionFalse))
+	})
+
+	It("skip mode: marks stale-failed tests as Skipped and keeps the Job", func() {
+		stallAt := time.Now().Add(-30 * time.Minute)
+		retryAt := time.Now().Add(-5 * time.Minute)
+
+		f.setStalled(ctx, "RolloutTestFailed", stallAt)
+		f.setTestFailed(ctx, stallAt.Add(-1*time.Minute), true)
+		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeSkip)
+
+		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Test phase is Skipped (not WaitingForStep like the retry path).
+		updatedTest := &rolloutv1alpha1.RolloutTest{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, updatedTest)).To(Succeed())
+		Expect(updatedTest.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseSkipped))
+
+		// Original failed Job is preserved (audit trail); retry mode would have deleted it.
+		var jobs batchv1.JobList
+		Expect(k8sClient.List(ctx, &jobs, client.InNamespace(f.ns), client.MatchingLabels{"rollout-test": f.rolloutTest.Name})).To(Succeed())
+		Expect(jobs.Items).To(HaveLen(1))
+
+		// Stalled condition cleared so the step can advance.
+		updated := &kruiserolloutv1beta1.Rollout{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}, updated)).To(Succeed())
+		for _, c := range updated.Status.Conditions {
+			if c.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
+				Expect(c.Status).To(Equal(corev1.ConditionFalse))
+			}
+		}
+	})
+
+	It("skip mode: Skipped phase stays stable across reconciles (not restalled or reset)", func() {
+		stallAt := time.Now().Add(-30 * time.Minute)
+		retryAt := time.Now().Add(-5 * time.Minute)
+
+		f.setStalled(ctx, "RolloutTestFailed", stallAt)
+		f.setTestFailed(ctx, stallAt.Add(-1*time.Minute), false)
+		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeSkip)
+
+		for i := 0; i < 3; i++ {
+			_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		updatedTest := &rolloutv1alpha1.RolloutTest{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, updatedTest)).To(Succeed())
+		Expect(updatedTest.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseSkipped))
+
+		updated := &kruiserolloutv1beta1.Rollout{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}, updated)).To(Succeed())
+		for _, c := range updated.Status.Conditions {
+			if c.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
+				Expect(c.Status).To(Equal(corev1.ConditionFalse))
+			}
+		}
 	})
 })
 
@@ -436,6 +495,23 @@ var _ = Describe("evaluateTests stale-failure guard", func() {
 		}
 		_, anyFailed, _ := r.evaluateTests(tests, nil)
 		Expect(anyFailed).To(BeTrue())
+	})
+
+	It("treats Skipped phase as passed (like Succeeded)", func() {
+		r := &RolloutStepGateReconciler{}
+		tests := []rolloutv1alpha1.RolloutTest{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "t1"},
+				Status:     rolloutv1alpha1.RolloutTestStatus{Phase: rolloutv1alpha1.RolloutTestPhaseSkipped},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "t2"},
+				Status:     rolloutv1alpha1.RolloutTestStatus{Phase: rolloutv1alpha1.RolloutTestPhaseSucceeded},
+			},
+		}
+		allPassed, anyFailed, _ := r.evaluateTests(tests, nil)
+		Expect(allPassed).To(BeTrue())
+		Expect(anyFailed).To(BeFalse())
 	})
 })
 

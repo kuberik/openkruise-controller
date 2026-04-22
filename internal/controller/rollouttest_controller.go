@@ -312,6 +312,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			if rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseCancelled &&
 				rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseSucceeded &&
 				rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseFailed &&
+				rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseSkipped &&
 				rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseWaitingForStep {
 				rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseCancelled
 				rolloutTest.Status.JobName = ""

@@ -458,6 +458,15 @@ spec:
                         this history entry.
                       format: int64
                       type: integer
+                    lastRetryMode:
+                      description: |-
+                        LastRetryMode records how the most recent retry should treat failed RolloutTests.
+                        "retry" (or empty): re-run failed tests; openkruise stepgate resets them to WaitingForStep.
+                        "skip":  mark failed tests as Skipped (treated as passing); skip the re-run.
+                      enum:
+                      - retry
+                      - skip
+                      type: string
                     lastRetryTimestamp:
                       description: |-
                         LastRetryTimestamp is the time when a retry was most recently requested for this deployment.
