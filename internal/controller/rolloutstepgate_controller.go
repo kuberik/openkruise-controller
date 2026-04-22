@@ -146,6 +146,21 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			log.Error(err, "failed to reset failed RolloutTests during retry")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 		}
+		// Refresh the step deadline annotations to retryCutoff. Without this, a
+		// stale "step-started-at" (from before the retry) can push the step past
+		// its step-ready-timeout window the moment Stalled is cleared, so the
+		// next reconcile re-stalls with StepReadyTimeoutExceeded — defeating the
+		// retry. Using retryCutoff (not time.Now) gives concurrent reconciles a
+		// deterministic anchor.
+		if err := r.resetStepDeadlineForRetry(ctx, &rollout, currentStepIndex, retryCutoff); err != nil {
+			log.Error(err, "failed to refresh step deadline during retry")
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+		}
+		// Refetch after the annotation update so clearStalledCondition sees the
+		// latest resource version.
+		if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
+			return ctrl.Result{}, err
+		}
 		if r.clearStalledCondition(&rollout) {
 			if err := r.Status().Update(ctx, &rollout); err != nil {
 				log.Error(err, "failed to clear Stalled condition during retry")
@@ -744,21 +759,26 @@ func (r *RolloutStepGateReconciler) clearStalledCondition(rollout *kruiserollout
 // linked to this Kruise Rollout via Kustomization. cutoff is nil when no retry has been
 // recorded. mode is one of "retry" / "skip" (empty when cutoff is nil).
 func (r *RolloutStepGateReconciler) getKuberikRetryCutoff(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) (cutoff *metav1.Time, mode string, err error) {
-	kuberikRollout, err := r.findKuberikRollout(ctx, rollout)
-	if err != nil || kuberikRollout == nil {
-		return nil, "", err
-	}
-	if len(kuberikRollout.Status.History) == 0 {
-		return nil, "", nil
-	}
-	entry := kuberikRollout.Status.History[0]
-	return entry.LastRetryTimestamp, entry.LastRetryMode, nil
+	return lookupKuberikRetryContext(ctx, r.Client, rollout, r.findKuberikRolloutForKustomization)
 }
 
 // findKuberikRollout resolves the kuberik Rollout associated with the given
 // Kruise Rollout via its Kustomization. Returns (nil, nil) when the linkage is
 // missing — this is a normal, non-error outcome.
 func (r *RolloutStepGateReconciler) findKuberikRollout(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) (*kuberikrolloutv1alpha1.Rollout, error) {
+	return findKuberikRollout(ctx, r.Client, rollout, r.findKuberikRolloutForKustomization)
+}
+
+// kuberikResolverFn is the Kustomization → kuberik Rollout resolver. The
+// RolloutStepGate reconciler already has this logic (iterates annotations,
+// falls back to OCIRepository references); we accept it as a parameter so the
+// RolloutTest reconciler can reuse the same resolution by sharing the Kuberik
+// Rollout lookup via this package-level helper.
+type kuberikResolverFn func(ctx context.Context, kustomization *kustomizev1.Kustomization) (*kuberikrolloutv1alpha1.Rollout, error)
+
+// findKuberikRollout is the package-level version of the method above, accepting
+// the Client and resolver as parameters. Used from multiple reconcilers.
+func findKuberikRollout(ctx context.Context, c client.Client, rollout *kruiserolloutv1beta1.Rollout, resolve kuberikResolverFn) (*kuberikrolloutv1alpha1.Rollout, error) {
 	kustomizeName := rollout.Annotations["kustomize.toolkit.fluxcd.io/name"]
 	if kustomizeName == "" {
 		kustomizeName = rollout.Labels["kustomize.toolkit.fluxcd.io/name"]
@@ -771,19 +791,41 @@ func (r *RolloutStepGateReconciler) findKuberikRollout(ctx context.Context, roll
 		return nil, nil
 	}
 	var kustomization kustomizev1.Kustomization
-	if err := r.Get(ctx, types.NamespacedName{Name: kustomizeName, Namespace: kustomizeNamespace}, &kustomization); err != nil {
+	if err := c.Get(ctx, types.NamespacedName{Name: kustomizeName, Namespace: kustomizeNamespace}, &kustomization); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return r.findKuberikRolloutForKustomization(ctx, &kustomization)
+	return resolve(ctx, &kustomization)
+}
+
+// lookupKuberikRetryContext reads the linked kuberik Rollout's latest history
+// entry and returns its LastRetryTimestamp and LastRetryMode. Returned cutoff
+// is nil when no retry has been recorded.
+func lookupKuberikRetryContext(ctx context.Context, c client.Client, rollout *kruiserolloutv1beta1.Rollout, resolve kuberikResolverFn) (*metav1.Time, string, error) {
+	kuberikRollout, err := findKuberikRollout(ctx, c, rollout, resolve)
+	if err != nil || kuberikRollout == nil {
+		return nil, "", err
+	}
+	if len(kuberikRollout.Status.History) == 0 {
+		return nil, "", nil
+	}
+	entry := kuberikRollout.Status.History[0]
+	return entry.LastRetryTimestamp, entry.LastRetryMode, nil
 }
 
 // stalledBefore reports whether the Kruise Rollout currently has a Stalled=True
 // condition whose LastTransitionTime is strictly before the given cutoff. This
 // is the signal that a retry postdates the stall and we should unwind it.
 func (r *RolloutStepGateReconciler) stalledBefore(rollout *kruiserolloutv1beta1.Rollout, cutoff *metav1.Time) bool {
+	return stalledBefore(rollout, cutoff)
+}
+
+// stalledBefore is the same check as the method above, exposed at package level so
+// the RolloutTest reconciler can apply the same stale-Stalled guard without
+// duplicating the condition-scanning logic.
+func stalledBefore(rollout *kruiserolloutv1beta1.Rollout, cutoff *metav1.Time) bool {
 	if cutoff == nil {
 		return false
 	}
@@ -793,6 +835,29 @@ func (r *RolloutStepGateReconciler) stalledBefore(rollout *kruiserolloutv1beta1.
 		}
 	}
 	return false
+}
+
+// resetStepDeadlineForRetry writes the step-started-at annotation to retryCutoff
+// and clears step-ready-at so the step-ready-timeout window restarts after a
+// retry. Called only in the retry-detected branch; no-op when annotations are
+// already aligned.
+func (r *RolloutStepGateReconciler) resetStepDeadlineForRetry(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout, stepIndex int32, retryCutoff *metav1.Time) error {
+	if retryCutoff == nil {
+		return nil
+	}
+	if rollout.Annotations == nil {
+		rollout.Annotations = make(map[string]string)
+	}
+	startedAtKey := fmt.Sprintf(internalAnnotationStepStartedAtPrefix, stepIndex)
+	readyAtKey := fmt.Sprintf(internalAnnotationStepReadyAtPrefix, stepIndex)
+	desired := retryCutoff.Format(time.RFC3339)
+	_, hasReadyAt := rollout.Annotations[readyAtKey]
+	if rollout.Annotations[startedAtKey] == desired && !hasReadyAt {
+		return nil
+	}
+	rollout.Annotations[startedAtKey] = desired
+	delete(rollout.Annotations, readyAtKey)
+	return r.Update(ctx, rollout)
 }
 
 // resetFailedTestsForStep handles stale-failed RolloutTests for the given step.
@@ -984,23 +1049,25 @@ func (r *RolloutStepGateReconciler) getBakeFailureStatus(ctx context.Context, ro
 }
 
 // findKuberikRolloutForKustomization finds the kuberik Rollout that references the given Kustomization.
-// It checks:
-// 1. Kustomization annotations for rollout references
-// 2. OCIRepository that the Kustomization references
-// 3. List all Rollouts and check for matching references
 func (r *RolloutStepGateReconciler) findKuberikRolloutForKustomization(ctx context.Context, kustomization *kustomizev1.Kustomization) (*kuberikrolloutv1alpha1.Rollout, error) {
+	return findKuberikRolloutForKustomization(ctx, r.Client, kustomization)
+}
+
+// findKuberikRolloutForKustomization resolves the kuberik Rollout associated with
+// the given Kustomization. It checks, in order:
+//  1. Kustomization annotations for rollout references (rollout.kuberik.com/substitute.*.from).
+//  2. The OCIRepository that the Kustomization references (rollout.kuberik.com/name or other
+//     rollout.kuberik.com/* annotations).
+// Returns (nil, nil) when the linkage is missing — a normal, non-error outcome.
+func findKuberikRolloutForKustomization(ctx context.Context, c client.Client, kustomization *kustomizev1.Kustomization) (*kuberikrolloutv1alpha1.Rollout, error) {
 	log := logf.FromContext(ctx)
 
-	// First, check if Kustomization has annotations that reference a kuberik Rollout
-	// Look for annotations like "rollout.kuberik.com/substitute.*.from"
 	if kustomization.Annotations != nil {
 		for key, value := range kustomization.Annotations {
 			if strings.HasPrefix(key, "rollout.kuberik.com/substitute.") && strings.HasSuffix(key, ".from") {
-				// Found a rollout reference, try to get it
 				rolloutName := value
-				// Try in the same namespace as the Kustomization first
 				var rollout kuberikrolloutv1alpha1.Rollout
-				err := r.Get(ctx, types.NamespacedName{
+				err := c.Get(ctx, types.NamespacedName{
 					Name:      rolloutName,
 					Namespace: kustomization.Namespace,
 				}, &rollout)
@@ -1010,7 +1077,6 @@ func (r *RolloutStepGateReconciler) findKuberikRolloutForKustomization(ctx conte
 						"namespace", kustomization.Namespace)
 					return &rollout, nil
 				}
-				// If Get failed, log but continue to check OCIRepository path
 				log.V(5).Info("Failed to get kuberik Rollout via Kustomization annotation, will try OCIRepository",
 					"rollout", rolloutName,
 					"namespace", kustomization.Namespace,
@@ -1019,7 +1085,6 @@ func (r *RolloutStepGateReconciler) findKuberikRolloutForKustomization(ctx conte
 		}
 	}
 
-	// If Kustomization references an OCIRepository, check if any Rollout references it
 	if kustomization.Spec.SourceRef.Kind == "OCIRepository" {
 		ociRepoName := kustomization.Spec.SourceRef.Name
 		ociRepoNamespace := kustomization.Namespace
@@ -1027,9 +1092,8 @@ func (r *RolloutStepGateReconciler) findKuberikRolloutForKustomization(ctx conte
 			ociRepoNamespace = kustomization.Spec.SourceRef.Namespace
 		}
 
-		// Get the OCIRepository
 		var ociRepo sourcev1.OCIRepository
-		if err := r.Get(ctx, types.NamespacedName{
+		if err := c.Get(ctx, types.NamespacedName{
 			Name:      ociRepoName,
 			Namespace: ociRepoNamespace,
 		}, &ociRepo); err != nil {
@@ -1039,16 +1103,14 @@ func (r *RolloutStepGateReconciler) findKuberikRolloutForKustomization(ctx conte
 			return nil, fmt.Errorf("failed to get OCIRepository %s/%s: %w", ociRepoNamespace, ociRepoName, err)
 		}
 
-		// Check if OCIRepository has annotations referencing a kuberik Rollout
 		if ociRepo.Annotations != nil {
-			// Look for direct rollout reference annotation
 			if rolloutName, exists := ociRepo.Annotations["rollout.kuberik.com/name"]; exists {
 				rolloutNamespace := ociRepoNamespace
 				if ns, exists := ociRepo.Annotations["rollout.kuberik.com/namespace"]; exists {
 					rolloutNamespace = ns
 				}
 				var rollout kuberikrolloutv1alpha1.Rollout
-				if err := r.Get(ctx, types.NamespacedName{
+				if err := c.Get(ctx, types.NamespacedName{
 					Name:      rolloutName,
 					Namespace: rolloutNamespace,
 				}, &rollout); err == nil {
@@ -1058,12 +1120,11 @@ func (r *RolloutStepGateReconciler) findKuberikRolloutForKustomization(ctx conte
 					return &rollout, nil
 				}
 			}
-			// Also check for other rollout.kuberik.com annotations
 			for key, value := range ociRepo.Annotations {
 				if strings.HasPrefix(key, "rollout.kuberik.com/") && key != "rollout.kuberik.com/namespace" {
 					rolloutName := value
 					var rollout kuberikrolloutv1alpha1.Rollout
-					if err := r.Get(ctx, types.NamespacedName{
+					if err := c.Get(ctx, types.NamespacedName{
 						Name:      rolloutName,
 						Namespace: ociRepoNamespace,
 					}, &rollout); err == nil {

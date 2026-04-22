@@ -42,6 +42,7 @@ type retryFixture struct {
 	kuberikRollout *kuberikrolloutv1alpha1.Rollout
 	rolloutTest    *rolloutv1alpha1.RolloutTest
 	reconciler     *RolloutStepGateReconciler
+	testReconciler *RolloutTestReconciler
 }
 
 func newRetryFixture(ctx context.Context) *retryFixture {
@@ -102,6 +103,10 @@ func newRetryFixture(ctx context.Context) *retryFixture {
 	kruiseRollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{CanaryRevision: "rev-1"}
 	kruiseRollout.Status.CanaryStatus.CurrentStepIndex = 1
 	kruiseRollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+	// rollouttest controller checks the top-level Status.CurrentStepIndex
+	// (separate from CanaryStatus.CurrentStepIndex); set both for parity.
+	kruiseRollout.Status.CurrentStepIndex = 1
+	kruiseRollout.Status.CurrentStepState = "StepPaused"
 	Expect(k8sClient.Status().Update(ctx, kruiseRollout)).To(Succeed())
 
 	rolloutTest := &rolloutv1alpha1.RolloutTest{
@@ -128,6 +133,7 @@ func newRetryFixture(ctx context.Context) *retryFixture {
 		kuberikRollout: kuberikRollout,
 		rolloutTest:    rolloutTest,
 		reconciler:     &RolloutStepGateReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()},
+		testReconciler: &RolloutTestReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()},
 	}
 }
 
@@ -613,5 +619,262 @@ var _ = Describe("RolloutTest preserves WaitingForStep under stall", func() {
 		updated := &rolloutv1alpha1.RolloutTest{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rolloutTest.Name, Namespace: namespace}, updated)).To(Succeed())
 		Expect(updated.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseCancelled))
+	})
+})
+
+var _ = Describe("RolloutStepGate step deadline refresh on retry", func() {
+	ctx := context.Background()
+	var f *retryFixture
+
+	// stepStartedAtKey / stepReadyAtKey are duplicated from the controller so
+	// tests don't couple to its unexported prefix formatting beyond the key
+	// strings they assert.
+	const stepStartedAtKey = "internal.rollout.kuberik.io/step-1-started-at"
+	const stepReadyAtKey = "internal.rollout.kuberik.io/step-1-ready-at"
+
+	BeforeEach(func() {
+		f = newRetryFixture(ctx)
+	})
+	AfterEach(func() {
+		f.cleanup(ctx)
+	})
+
+	// seedStaleDeadline puts step-started-at in the past so its deadline is
+	// already exceeded — the exact situation that caused re-stall before
+	// Fix A: stepgate clears Stalled, next reconcile sees "deadline exceeded",
+	// re-stalls with StepReadyTimeoutExceeded.
+	seedStaleDeadline := func(ctx context.Context, stalePast time.Time) {
+		GinkgoHelper()
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}, f.kruiseRollout)).To(Succeed())
+		if f.kruiseRollout.Annotations == nil {
+			f.kruiseRollout.Annotations = map[string]string{}
+		}
+		f.kruiseRollout.Annotations[stepStartedAtKey] = stalePast.Format(time.RFC3339)
+		f.kruiseRollout.Annotations[stepReadyAtKey] = stalePast.Add(30 * time.Second).Format(time.RFC3339)
+		f.kruiseRollout.Annotations["rollout.kuberik.io/step-1-ready-timeout"] = "1m"
+		f.kruiseRollout.Annotations["internal.rollout.kuberik.io/last-step-index"] = "1"
+		Expect(k8sClient.Update(ctx, f.kruiseRollout)).To(Succeed())
+	}
+
+	It("refreshes step-started-at to retryCutoff and clears step-ready-at", func() {
+		stalePast := time.Now().Add(-30 * time.Minute)
+		retryAt := time.Now().Add(-5 * time.Minute)
+
+		seedStaleDeadline(ctx, stalePast)
+		f.setStalled(ctx, "RolloutTestFailed", stalePast.Add(1*time.Minute))
+		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
+
+		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &kruiserolloutv1beta1.Rollout{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}, updated)).To(Succeed())
+		Expect(updated.Annotations[stepStartedAtKey]).To(Equal(retryAt.Format(time.RFC3339)))
+		Expect(updated.Annotations).NotTo(HaveKey(stepReadyAtKey))
+	})
+
+	It("doesn't touch deadline when retry cutoff is absent", func() {
+		stalePast := time.Now().Add(-30 * time.Minute)
+		stallAt := time.Now().Add(-1 * time.Minute)
+
+		seedStaleDeadline(ctx, stalePast)
+		f.setStalled(ctx, "StepReadyTimeoutExceeded", stallAt)
+		// No setKuberikRetry — no retry recorded.
+
+		before := stalePast.Format(time.RFC3339)
+		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &kruiserolloutv1beta1.Rollout{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}, updated)).To(Succeed())
+		Expect(updated.Annotations[stepStartedAtKey]).To(Equal(before), "step-started-at should not be refreshed without a retry cutoff")
+	})
+
+	It("back-to-back retries advance step-started-at each time", func() {
+		stalePast := time.Now().Add(-30 * time.Minute)
+		firstRetry := time.Now().Add(-10 * time.Minute).Truncate(time.Second)
+		secondRetry := time.Now().Add(-2 * time.Minute).Truncate(time.Second)
+
+		seedStaleDeadline(ctx, stalePast)
+		f.setStalled(ctx, "RolloutTestFailed", stalePast.Add(1*time.Minute))
+		f.setKuberikRetry(ctx, firstRetry, kuberikrolloutv1alpha1.RetryModeRetry)
+
+		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		first := &kruiserolloutv1beta1.Rollout{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}, first)).To(Succeed())
+		Expect(first.Annotations[stepStartedAtKey]).To(Equal(firstRetry.Format(time.RFC3339)))
+
+		// Simulate a fresh stall after first retry, then another retry with
+		// newer cutoff.
+		f.setStalled(ctx, "RolloutTestFailed", firstRetry.Add(10*time.Second))
+		f.setKuberikRetry(ctx, secondRetry, kuberikrolloutv1alpha1.RetryModeRetry)
+
+		_, err = f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		second := &kruiserolloutv1beta1.Rollout{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}, second)).To(Succeed())
+		Expect(second.Annotations[stepStartedAtKey]).To(Equal(secondRetry.Format(time.RFC3339)))
+	})
+})
+
+var _ = Describe("RolloutTest stale-Stalled guard (retry cutoff)", func() {
+	ctx := context.Background()
+	var f *retryFixture
+
+	BeforeEach(func() {
+		f = newRetryFixture(ctx)
+	})
+	AfterEach(func() {
+		f.cleanup(ctx)
+	})
+
+	// markTestPhase writes a non-terminal phase so the rollouttest controller's
+	// "stalled → cancel" branch has something to actually cancel. Without this
+	// the controller's early-exit for terminal phases would hide the guard.
+	markTestPhase := func(ctx context.Context, phase rolloutv1alpha1.RolloutTestPhase) {
+		GinkgoHelper()
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, f.rolloutTest)).To(Succeed())
+		f.rolloutTest.Status.Phase = phase
+		f.rolloutTest.Status.ObservedCanaryRevision = "rev-1"
+		Expect(k8sClient.Status().Update(ctx, f.rolloutTest)).To(Succeed())
+	}
+
+	It("does NOT cancel a Pending test when Stalled predates the retry cutoff", func() {
+		// Stalled set 30 min ago (pre-retry), retry 1 min ago. The stall is
+		// stale — stepgate is unwinding. The rollouttest controller should
+		// hold off, not cancel.
+		stallAt := time.Now().Add(-30 * time.Minute)
+		retryAt := time.Now().Add(-1 * time.Minute)
+
+		f.setStalled(ctx, "KuberikRolloutBakeFailed", stallAt)
+		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
+		markTestPhase(ctx, rolloutv1alpha1.RolloutTestPhasePending)
+
+		result, err := f.testReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).NotTo(BeZero(), "should requeue while waiting for stepgate to clear stale stall")
+
+		updated := &rolloutv1alpha1.RolloutTest{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhasePending), "phase must not flip to Cancelled on stale stall")
+	})
+
+	It("DOES cancel a Pending test when Stalled is fresh (postdates retry cutoff)", func() {
+		// Retry was a while ago, stall happened just now — this is a genuine
+		// post-retry failure. The guard should not apply; normal cancel runs.
+		retryAt := time.Now().Add(-30 * time.Minute)
+		stallAt := time.Now().Add(-5 * time.Second)
+
+		f.setStalled(ctx, "KuberikRolloutBakeFailed", stallAt)
+		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
+		markTestPhase(ctx, rolloutv1alpha1.RolloutTestPhasePending)
+
+		_, err := f.testReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &rolloutv1alpha1.RolloutTest{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseCancelled))
+	})
+
+	It("cancels normally when no retry cutoff is recorded", func() {
+		stallAt := time.Now().Add(-10 * time.Minute)
+
+		f.setStalled(ctx, "KuberikRolloutBakeFailed", stallAt)
+		// no setKuberikRetry → no cutoff → guard is inert
+		markTestPhase(ctx, rolloutv1alpha1.RolloutTestPhasePending)
+
+		_, err := f.testReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &rolloutv1alpha1.RolloutTest{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseCancelled))
+	})
+
+	It("does NOT delete an existing Job when Stalled predates retry cutoff (job-exists branch)", func() {
+		stallAt := time.Now().Add(-30 * time.Minute)
+		retryAt := time.Now().Add(-1 * time.Minute)
+
+		f.setStalled(ctx, "KuberikRolloutBakeFailed", stallAt)
+		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
+
+		// Create a Job owned by the test with the current canary revision label.
+		job := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "app-test-job",
+				Namespace: f.ns,
+				Labels: map[string]string{
+					"rollout-test":                         f.rolloutTest.Name,
+					"rollout.kuberik.io/canary-revision":   "rev-1",
+				},
+			},
+			Spec: f.rolloutTest.Spec.JobTemplate,
+		}
+		Expect(k8sClient.Create(ctx, job)).To(Succeed())
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, f.rolloutTest)).To(Succeed())
+		f.rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseRunning
+		f.rolloutTest.Status.ObservedCanaryRevision = "rev-1"
+		f.rolloutTest.Status.JobName = job.Name
+		Expect(k8sClient.Status().Update(ctx, f.rolloutTest)).To(Succeed())
+
+		_, err := f.testReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Job should still exist — stale stall shouldn't trigger deletion.
+		var jobs batchv1.JobList
+		Expect(k8sClient.List(ctx, &jobs, client.InNamespace(f.ns), client.MatchingLabels{"rollout-test": f.rolloutTest.Name})).To(Succeed())
+		Expect(jobs.Items).To(HaveLen(1))
+
+		// Phase should NOT be Cancelled (the guard prevented the cancel branch).
+		// The rollouttest controller's normal updateStatus path will derive the
+		// phase from the Job — Pending or Running — depending on whether the job
+		// has started. Either is correct.
+		updated := &rolloutv1alpha1.RolloutTest{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).NotTo(Equal(rolloutv1alpha1.RolloutTestPhaseCancelled))
+	})
+
+	It("DOES delete an existing Job when Stalled is fresh (job-exists branch)", func() {
+		retryAt := time.Now().Add(-30 * time.Minute)
+		stallAt := time.Now().Add(-5 * time.Second)
+
+		f.setStalled(ctx, "KuberikRolloutBakeFailed", stallAt)
+		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
+
+		job := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "app-test-job-fresh",
+				Namespace: f.ns,
+				Labels: map[string]string{
+					"rollout-test":                         f.rolloutTest.Name,
+					"rollout.kuberik.io/canary-revision":   "rev-1",
+				},
+			},
+			Spec: f.rolloutTest.Spec.JobTemplate,
+		}
+		Expect(k8sClient.Create(ctx, job)).To(Succeed())
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, f.rolloutTest)).To(Succeed())
+		f.rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseRunning
+		f.rolloutTest.Status.ObservedCanaryRevision = "rev-1"
+		f.rolloutTest.Status.JobName = job.Name
+		Expect(k8sClient.Status().Update(ctx, f.rolloutTest)).To(Succeed())
+
+		_, err := f.testReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Fresh stall → job should be deleted (original behavior).
+		Eventually(func() int {
+			var jobs batchv1.JobList
+			if err := k8sClient.List(ctx, &jobs, client.InNamespace(f.ns), client.MatchingLabels{"rollout-test": f.rolloutTest.Name}); err != nil {
+				return -1
+			}
+			return len(jobs.Items)
+		}).Should(Equal(0))
 	})
 })
