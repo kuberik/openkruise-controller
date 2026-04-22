@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -33,9 +34,16 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
 	rolloutv1alpha1 "github.com/kuberik/openkruise-controller/api/v1alpha1"
+	kuberikrolloutv1alpha1 "github.com/kuberik/rollout-controller/api/v1alpha1"
 	kruiserolloutv1beta1 "github.com/openkruise/kruise-rollout-api/rollouts/v1beta1"
 )
+
+// kuberikRetryResolver resolves the Kustomization → kuberik Rollout linkage for
+// the RolloutTest reconciler. Extracted as a variable so tests can inject a
+// fake.
+var kuberikRetryResolver = findKuberikRolloutForKustomization
 
 // RolloutTestReconciler reconciles a RolloutTest object
 type RolloutTestReconciler struct {
@@ -98,6 +106,18 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		isStalled, stallReason := r.isRolloutStalled(&rollout)
 		// If stalled due to TestFailed, do NOT cancel the job - let it be reported as Failed
 		shouldCancel := isStalled && stallReason != "RolloutTestFailed"
+		// Same stale-Stalled guard as the no-job branch: if a retry postdates the
+		// Stalled transition, the stepgate is unwinding the stall — don't delete
+		// the Job based on a condition that's about to be cleared.
+		if shouldCancel {
+			retryCutoff, _ := r.lookupKuberikRetryCutoff(ctx, &rollout)
+			if stalledBefore(&rollout, retryCutoff) {
+				log.Info("Rollout stalled but stall predates retry — leaving job intact",
+					"reason", stallReason,
+					"retryCutoff", retryCutoff.Format(time.RFC3339))
+				shouldCancel = false
+			}
+		}
 
 		if rollout.Status.CurrentStepIndex != rolloutTest.Spec.StepIndex || shouldCancel {
 			cancellationMessage := "Test job was cancelled because rollout step moved forward"
@@ -305,11 +325,27 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		isStalled, stallReason := r.isRolloutStalled(&rollout)
 		// If stalled for any reason, don't create new jobs
 		if isStalled {
+			// Guard against acting on a stale Stalled condition: if a retry on
+			// the linked Kuberik Rollout postdates the Stalled transition, the
+			// stepgate is about to clear it. Acting now would cancel a test the
+			// stepgate just reset to WaitingForStep (or about to). Requeue and
+			// let stepgate's clear propagate.
+			retryCutoff, _ := r.lookupKuberikRetryCutoff(ctx, &rollout)
+			if stalledBefore(&rollout, retryCutoff) {
+				log.Info("Rollout is stalled but stall predates retry — waiting for stepgate to clear",
+					"step", rolloutTest.Spec.StepIndex, "reason", stallReason,
+					"retryCutoff", retryCutoff.Format(time.RFC3339))
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
 			log.Info("Rollout is stalled, not creating Job", "step", rolloutTest.Spec.StepIndex, "reason", stallReason)
-			// Only cancel if not already in a terminal state (Succeeded, Failed, or Cancelled)
+			// Only cancel active (Pending/Running) tests. WaitingForStep is the
+			// parked state the stepgate uses to signal a retry reset — cancelling
+			// it here would race with that reset and lose the re-run.
 			if rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseCancelled &&
 				rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseSucceeded &&
-				rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseFailed {
+				rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseFailed &&
+				rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseSkipped &&
+				rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseWaitingForStep {
 				rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseCancelled
 				rolloutTest.Status.JobName = ""
 
@@ -346,10 +382,20 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			}
 			return ctrl.Result{}, nil
 		}
-		// Don't auto-retry if test already failed - wait for user to continue rollout
-		// This prevents a race where the rolloutstepgate hasn't set Stalled yet on the Kruise rollout
-		if rolloutTest.Status.Phase == rolloutv1alpha1.RolloutTestPhaseFailed {
-			log.Info("Test already failed, waiting for manual intervention", "step", rolloutTest.Spec.StepIndex)
+		// Terminal phases don't auto-recreate jobs. Failed, Cancelled, Skipped,
+		// and Succeeded tests stay put until either (a) a retry via the Kuberik
+		// Rollout's retry annotation resets them to WaitingForStep / Skipped, or
+		// (b) a new canary revision is observed (handled above). Without this
+		// guard, stepgate's Skipped/reset patches race with a fresh job creation
+		// here — the controller sees the old Cancelled phase and creates a new
+		// job that eventually overwrites Skipped with Pending → Failed.
+		if rolloutTest.Status.Phase == rolloutv1alpha1.RolloutTestPhaseFailed ||
+			rolloutTest.Status.Phase == rolloutv1alpha1.RolloutTestPhaseCancelled ||
+			rolloutTest.Status.Phase == rolloutv1alpha1.RolloutTestPhaseSkipped ||
+			rolloutTest.Status.Phase == rolloutv1alpha1.RolloutTestPhaseSucceeded {
+			log.Info("Test is in a terminal phase, not creating new Job",
+				"step", rolloutTest.Spec.StepIndex,
+				"phase", rolloutTest.Status.Phase)
 			return ctrl.Result{}, nil
 		}
 		// Check if canary is in paused state before creating the job
@@ -573,6 +619,22 @@ func (r *RolloutTestReconciler) isCanaryPaused(rollout *kruiserolloutv1beta1.Rol
 	// Common values: "StepPaused", "Paused", etc.
 	state := rollout.Status.CanaryStatus.CurrentStepState
 	return state == "StepPaused" || state == "Paused"
+}
+
+// lookupKuberikRetryCutoff returns (LastRetryTimestamp, LastRetryMode) from the
+// linked kuberik Rollout, or (nil, "") when the linkage is missing or no retry
+// has been recorded. Errors are logged at debug level and swallowed — the
+// stale-Stalled guard is a best-effort safeguard, so a lookup failure means we
+// fall through to the conservative default (treat Stalled as fresh).
+func (r *RolloutTestReconciler) lookupKuberikRetryCutoff(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) (*metav1.Time, string) {
+	cutoff, mode, err := lookupKuberikRetryContext(ctx, r.Client, rollout, func(ctx context.Context, k *kustomizev1.Kustomization) (*kuberikrolloutv1alpha1.Rollout, error) {
+		return kuberikRetryResolver(ctx, r.Client, k)
+	})
+	if err != nil {
+		logf.FromContext(ctx).V(5).Info("failed to read kuberik retry context", "error", err)
+		return nil, ""
+	}
+	return cutoff, mode
 }
 
 // isRolloutStalled checks if the rollout is in a stalled state

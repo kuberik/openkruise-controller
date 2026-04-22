@@ -67,6 +67,24 @@ spec:
           spec:
             description: RolloutSpec defines the desired state of Rollout.
             properties:
+              availableReleasesMinCount:
+                default: 30
+                description: |-
+                  AvailableReleasesMinCount defines the minimum number of available releases to always keep
+                  When history is full, at least this many releases will be retained regardless of other criteria.
+                  Defaults to 30 if not specified.
+                format: int32
+                minimum: 1
+                type: integer
+              availableReleasesRetentionDays:
+                default: 7
+                description: |-
+                  AvailableReleasesRetentionDays defines how many days of available releases to keep based on creation timestamp
+                  When history is full, releases older than this retention period may be removed.
+                  Defaults to 7 days if not specified.
+                format: int32
+                minimum: 1
+                type: integer
               bakeTime:
                 description: |-
                   BakeTime specifies how long to wait after bake starts before marking as successful
@@ -198,7 +216,7 @@ spec:
                 type: object
                 x-kubernetes-map-type: atomic
               versionHistoryLimit:
-                default: 5
+                default: 10
                 description: VersionHistoryLimit defines the maximum number of entries
                   to keep in the deployment history
                 format: int32
@@ -440,6 +458,23 @@ spec:
                         this history entry.
                       format: int64
                       type: integer
+                    lastRetryMode:
+                      description: |-
+                        LastRetryMode records how the most recent retry should treat failed RolloutTests.
+                        "retry" (or empty): re-run failed tests; openkruise stepgate resets them to WaitingForStep.
+                        "skip":  mark failed tests as Skipped (treated as passing); skip the re-run.
+                      enum:
+                      - retry
+                      - skip
+                      type: string
+                    lastRetryTimestamp:
+                      description: |-
+                        LastRetryTimestamp is the time when a retry was most recently requested for this deployment.
+                        When set, downstream controllers (health checks, kruise rollout step gates) use this as a
+                        cutoff: stale failure conditions with LastTransitionTime older than LastRetryTimestamp are
+                        ignored as they reflect the pre-retry state.
+                      format: date-time
+                      type: string
                     message:
                       description: |-
                         Message provides a descriptive message about this deployment entry
@@ -452,6 +487,32 @@ spec:
                       description: Timestamp is the time when the deployment occurred.
                       format: date-time
                       type: string
+                    triggeredBy:
+                      description: |-
+                        TriggeredBy indicates what triggered this deployment.
+                        Kind can be "User" for manual deployments triggered by a user, or "System" for automatic deployments.
+                        Name contains the name of the user or system that triggered the deployment.
+                        For user-triggered deployments, this is extracted from the "rollout.kuberik.com/deploy-user" annotation.
+                        For system-triggered deployments, this is typically "rollout-controller".
+                      properties:
+                        kind:
+                          description: |-
+                            Kind indicates the type of trigger: "User" for manual deployments triggered by a user,
+                            or "System" for automatic deployments triggered by the rollout controller.
+                          enum:
+                          - User
+                          - System
+                          type: string
+                        name:
+                          description: |-
+                            Name contains the name of the user or system that triggered the deployment.
+                            For user-triggered deployments, this is extracted from the "rollout.kuberik.com/deploy-user" annotation.
+                            For system-triggered deployments, this is typically "rollout-controller".
+                          type: string
+                      required:
+                      - kind
+                      - name
+                      type: object
                     version:
                       description: Version is the version information that was deployed.
                       properties:

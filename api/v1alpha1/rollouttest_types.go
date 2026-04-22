@@ -40,7 +40,7 @@ type RolloutTestSpec struct {
 }
 
 // RolloutTestPhase represents the current phase of a RolloutTest
-// +kubebuilder:validation:Enum=WaitingForStep;Pending;Running;Succeeded;Failed;Cancelled
+// +kubebuilder:validation:Enum=WaitingForStep;Pending;Running;Succeeded;Failed;Cancelled;Skipped
 type RolloutTestPhase string
 
 const (
@@ -56,6 +56,10 @@ const (
 	RolloutTestPhaseFailed RolloutTestPhase = "Failed"
 	// RolloutTestPhaseCancelled indicates the test job was cancelled (e.g., when step was manually approved)
 	RolloutTestPhaseCancelled RolloutTestPhase = "Cancelled"
+	// RolloutTestPhaseSkipped indicates the test was intentionally bypassed on retry (mode=skip on
+	// the Kuberik Rollout). Treated as passing for step progression — distinguishes user-initiated
+	// bypass from Cancelled, which reflects unrelated state changes (step advanced, rollout cancelled).
+	RolloutTestPhaseSkipped RolloutTestPhase = "Skipped"
 )
 
 // RolloutTestStatus defines the observed state of RolloutTest.
