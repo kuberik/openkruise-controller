@@ -4,5 +4,5 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 images:
 - name: controller
-  newName: ghcr.io/kuberik/openkruise-controller
-  newTag: v0.3.3
+  newName: ghcr.io/kuberik/kuberik/openkruise-controller
+  newTag: b2b5e181a7221e7e48d8277fb54ee70e4ab4627a-1776858502
