@@ -62,6 +62,27 @@ const (
 	RolloutTestPhaseSkipped RolloutTestPhase = "Skipped"
 )
 
+const (
+	// RetryModeAnnotation is set by the user (or rollout-dashboard) on the kuberik Rollout to
+	// control how this controller handles failed RolloutTests when a new retry is requested.
+	// The rollout-controller is unaware of this annotation; the openkruise-controller reads it
+	// alongside the kuberik Rollout's LastRetryTimestamp.
+	//
+	// Values:
+	//   "retry" (or empty/unknown): re-run failed RolloutTests by resetting them to WaitingForStep.
+	//   "skip":                     mark failed RolloutTests as Skipped (treated as passing).
+	//
+	// The annotation is consumed (removed by this controller) after it acts on a fresh
+	// LastRetryTimestamp — setting it once does not affect future retries.
+	RetryModeAnnotation = "rollouttest.kuberik.com/retry-mode"
+
+	// RetryModeRetry re-runs failed RolloutTests on retry (the default).
+	RetryModeRetry = "retry"
+
+	// RetryModeSkip marks failed RolloutTests as Skipped on retry.
+	RetryModeSkip = "skip"
+)
+
 // RolloutTestStatus defines the observed state of RolloutTest.
 type RolloutTestStatus struct {
 	// Conditions store the status conditions of the RolloutTest.

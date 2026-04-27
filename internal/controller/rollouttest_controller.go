@@ -621,13 +621,17 @@ func (r *RolloutTestReconciler) isCanaryPaused(rollout *kruiserolloutv1beta1.Rol
 	return state == "StepPaused" || state == "Paused"
 }
 
-// lookupKuberikRetryCutoff returns (LastRetryTimestamp, LastRetryMode) from the
+// lookupKuberikRetryCutoff returns (LastRetryTimestamp, retry mode) from the
 // linked kuberik Rollout, or (nil, "") when the linkage is missing or no retry
 // has been recorded. Errors are logged at debug level and swallowed — the
 // stale-Stalled guard is a best-effort safeguard, so a lookup failure means we
 // fall through to the conservative default (treat Stalled as fresh).
+//
+// This is a read-only check: the kuberik Rollout pointer is intentionally
+// dropped because the test reconciler observes the retry but does not act on it
+// (and therefore must not clear the mode annotation — that is the stepgate's job).
 func (r *RolloutTestReconciler) lookupKuberikRetryCutoff(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) (*metav1.Time, string) {
-	cutoff, mode, err := lookupKuberikRetryContext(ctx, r.Client, rollout, func(ctx context.Context, k *kustomizev1.Kustomization) (*kuberikrolloutv1alpha1.Rollout, error) {
+	_, cutoff, mode, err := lookupKuberikRetryContext(ctx, r.Client, rollout, func(ctx context.Context, k *kustomizev1.Kustomization) (*kuberikrolloutv1alpha1.Rollout, error) {
 		return kuberikRetryResolver(ctx, r.Client, k)
 	})
 	if err != nil {

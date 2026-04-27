@@ -133,7 +133,7 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// the Stalled condition. Tests whose Failed condition transitioned before the
 	// cutoff are treated as pending by evaluateTests (see below) to prevent
 	// immediate re-stall during the reset window.
-	retryCutoff, retryMode, err := r.getKuberikRetryCutoff(ctx, &rollout)
+	kuberikRollout, retryCutoff, retryMode, err := r.getKuberikRetryCutoff(ctx, &rollout)
 	if err != nil {
 		log.Error(err, "failed to fetch kuberik rollout retry timestamp")
 		// Non-fatal, continue
@@ -145,6 +145,14 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if err := r.resetFailedTestsForStep(ctx, rollout.Namespace, rollout.Name, currentStepIndex, retryCutoff, retryMode); err != nil {
 			log.Error(err, "failed to reset failed RolloutTests during retry")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+		}
+		// Clear the rollouttest.kuberik.com/retry-mode annotation now that we have
+		// acted on this retry. Failure here is logged but non-fatal — a leftover
+		// annotation only affects future retries until the user updates it.
+		if kuberikRollout != nil {
+			if err := clearKuberikRetryModeAnnotation(ctx, r.Client, kuberikRollout); err != nil {
+				log.Error(err, "failed to clear retry-mode annotation on kuberik Rollout")
+			}
 		}
 		// Refresh the step deadline annotations to retryCutoff. Without this, a
 		// stale "step-started-at" (from before the retry) can push the step past
@@ -755,10 +763,12 @@ func (r *RolloutStepGateReconciler) clearStalledCondition(rollout *kruiserollout
 	return true
 }
 
-// getKuberikRetryCutoff returns the LastRetryTimestamp and mode from the kuberik Rollout
-// linked to this Kruise Rollout via Kustomization. cutoff is nil when no retry has been
-// recorded. mode is one of "retry" / "skip" (empty when cutoff is nil).
-func (r *RolloutStepGateReconciler) getKuberikRetryCutoff(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) (cutoff *metav1.Time, mode string, err error) {
+// getKuberikRetryCutoff returns the linked kuberik Rollout, its LastRetryTimestamp,
+// and the retry mode (read from the rollouttest.kuberik.com/retry-mode annotation).
+// cutoff is nil when no retry has been recorded. mode defaults to "retry" when the
+// annotation is absent or unrecognized. The kuberik Rollout pointer is returned so
+// the caller can clear the mode annotation after acting on a fresh retry.
+func (r *RolloutStepGateReconciler) getKuberikRetryCutoff(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) (kuberikRollout *kuberikrolloutv1alpha1.Rollout, cutoff *metav1.Time, mode string, err error) {
 	return lookupKuberikRetryContext(ctx, r.Client, rollout, r.findKuberikRolloutForKustomization)
 }
 
@@ -801,18 +811,57 @@ func findKuberikRollout(ctx context.Context, c client.Client, rollout *kruiserol
 }
 
 // lookupKuberikRetryContext reads the linked kuberik Rollout's latest history
-// entry and returns its LastRetryTimestamp and LastRetryMode. Returned cutoff
-// is nil when no retry has been recorded.
-func lookupKuberikRetryContext(ctx context.Context, c client.Client, rollout *kruiserolloutv1beta1.Rollout, resolve kuberikResolverFn) (*metav1.Time, string, error) {
+// entry for LastRetryTimestamp, and reads the retry mode from the
+// rollouttest.kuberik.com/retry-mode annotation on the kuberik Rollout. Returned
+// cutoff is nil when no retry has been recorded; mode defaults to RetryModeRetry
+// when the annotation is absent or unrecognized.
+//
+// The kuberik Rollout pointer is returned so callers acting on a fresh retry can
+// clear the mode annotation via clearKuberikRetryModeAnnotation.
+func lookupKuberikRetryContext(ctx context.Context, c client.Client, rollout *kruiserolloutv1beta1.Rollout, resolve kuberikResolverFn) (*kuberikrolloutv1alpha1.Rollout, *metav1.Time, string, error) {
 	kuberikRollout, err := findKuberikRollout(ctx, c, rollout, resolve)
 	if err != nil || kuberikRollout == nil {
-		return nil, "", err
+		return nil, nil, "", err
 	}
-	if len(kuberikRollout.Status.History) == 0 {
-		return nil, "", nil
+	var cutoff *metav1.Time
+	if len(kuberikRollout.Status.History) > 0 {
+		cutoff = kuberikRollout.Status.History[0].LastRetryTimestamp
 	}
-	entry := kuberikRollout.Status.History[0]
-	return entry.LastRetryTimestamp, entry.LastRetryMode, nil
+	return kuberikRollout, cutoff, retryModeFromAnnotation(kuberikRollout), nil
+}
+
+// retryModeFromAnnotation reads the retry-mode annotation on the kuberik Rollout
+// and normalizes it. Anything other than "skip" defaults to "retry".
+func retryModeFromAnnotation(rollout *kuberikrolloutv1alpha1.Rollout) string {
+	if v, ok := rollout.Annotations[rolloutv1alpha1.RetryModeAnnotation]; ok && v == rolloutv1alpha1.RetryModeSkip {
+		return rolloutv1alpha1.RetryModeSkip
+	}
+	return rolloutv1alpha1.RetryModeRetry
+}
+
+// clearKuberikRetryModeAnnotation removes rollouttest.kuberik.com/retry-mode from the
+// kuberik Rollout via JSON patch. The patch is targeted (single op, single path) so
+// concurrent updates to other fields (e.g. LastRetryTimestamp by the rollout controller)
+// are not at risk of being overwritten the way a MergeFrom diff could be.
+//
+// Idempotent against the in-memory copy: returns nil when the annotation is absent.
+// If the API server reports the path missing (another reconcile already cleared it),
+// the resulting Invalid error is treated as success.
+func clearKuberikRetryModeAnnotation(ctx context.Context, c client.Client, rollout *kuberikrolloutv1alpha1.Rollout) error {
+	if _, has := rollout.Annotations[rolloutv1alpha1.RetryModeAnnotation]; !has {
+		return nil
+	}
+	// JSON Pointer escape: ~ → ~0, then / → ~1 (order matters to avoid double-escape).
+	escaped := strings.ReplaceAll(rolloutv1alpha1.RetryModeAnnotation, "~", "~0")
+	escaped = strings.ReplaceAll(escaped, "/", "~1")
+	patch := []byte(fmt.Sprintf(`[{"op":"remove","path":"/metadata/annotations/%s"}]`, escaped))
+	if err := c.Patch(ctx, rollout, client.RawPatch(types.JSONPatchType, patch)); err != nil {
+		if apierrors.IsInvalid(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // stalledBefore reports whether the Kruise Rollout currently has a Stalled=True
@@ -881,7 +930,7 @@ func (r *RolloutStepGateReconciler) resetFailedTestsForStep(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	skipMode := retryMode == kuberikrolloutv1alpha1.RetryModeSkip
+	skipMode := retryMode == rolloutv1alpha1.RetryModeSkip
 	for i := range tests {
 		test := &tests[i]
 		if !isStaleFailedTest(test, retryCutoff) {

@@ -142,12 +142,20 @@ func (f *retryFixture) cleanup(ctx context.Context) {
 	Expect(k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: f.ns}})).To(Succeed())
 }
 
-// setKuberikRetry stamps LastRetryTimestamp (and mode) on the kuberik Rollout's
-// latest history entry. retryAt is the simulated retry moment. mode is "retry" or
-// "skip" (empty treated as retry by downstream logic).
+// setKuberikRetry stamps LastRetryTimestamp on the kuberik Rollout's latest history
+// entry and sets the rollouttest.kuberik.com/retry-mode annotation when mode is
+// non-empty. retryAt is the simulated retry moment. mode is "retry" or "skip"
+// (empty leaves the annotation unset, which the controller treats as retry).
 func (f *retryFixture) setKuberikRetry(ctx context.Context, retryAt time.Time, mode string) {
 	GinkgoHelper()
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.kuberikRollout.Name, Namespace: f.ns}, f.kuberikRollout)).To(Succeed())
+	if mode != "" {
+		if f.kuberikRollout.Annotations == nil {
+			f.kuberikRollout.Annotations = map[string]string{}
+		}
+		f.kuberikRollout.Annotations[rolloutv1alpha1.RetryModeAnnotation] = mode
+		Expect(k8sClient.Update(ctx, f.kuberikRollout)).To(Succeed())
+	}
 	ts := metav1.NewTime(retryAt)
 	deploying := kuberikrolloutv1alpha1.BakeStatusDeploying
 	f.kuberikRollout.Status.History = []kuberikrolloutv1alpha1.DeploymentHistoryEntry{{
@@ -155,7 +163,6 @@ func (f *retryFixture) setKuberikRetry(ctx context.Context, retryAt time.Time, m
 		Timestamp:          metav1.NewTime(retryAt.Add(-30 * time.Minute)),
 		BakeStatus:         &deploying,
 		LastRetryTimestamp: &ts,
-		LastRetryMode:      mode,
 	}}
 	Expect(k8sClient.Status().Update(ctx, f.kuberikRollout)).To(Succeed())
 }
@@ -233,7 +240,7 @@ var _ = Describe("RolloutStepGate retry handling", func() {
 
 		f.setStalled(ctx, "RolloutTestFailed", stallAt)
 		f.setTestFailed(ctx, stallAt.Add(-1*time.Minute), true)
-		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
+		f.setKuberikRetry(ctx, retryAt, rolloutv1alpha1.RetryModeRetry)
 
 		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
 		Expect(err).NotTo(HaveOccurred())
@@ -266,7 +273,7 @@ var _ = Describe("RolloutStepGate retry handling", func() {
 
 		f.setStalled(ctx, "RolloutTestFailed", stallAt)
 		f.setTestFailed(ctx, stallAt, false)
-		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
+		f.setKuberikRetry(ctx, retryAt, rolloutv1alpha1.RetryModeRetry)
 
 		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
 		Expect(err).NotTo(HaveOccurred())
@@ -307,7 +314,7 @@ var _ = Describe("RolloutStepGate retry handling", func() {
 		retryAt := time.Now().Add(-2 * time.Minute)
 
 		f.setStalled(ctx, "KuberikRolloutBakeFailed", stallAt)
-		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
+		f.setKuberikRetry(ctx, retryAt, rolloutv1alpha1.RetryModeRetry)
 
 		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
 		Expect(err).NotTo(HaveOccurred())
@@ -330,7 +337,7 @@ var _ = Describe("RolloutStepGate retry handling", func() {
 
 		f.setStalled(ctx, "RolloutTestFailed", stallAt)
 		f.setTestFailed(ctx, stallAt.Add(-1*time.Minute), true)
-		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
+		f.setKuberikRetry(ctx, retryAt, rolloutv1alpha1.RetryModeRetry)
 
 		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
 		Expect(err).NotTo(HaveOccurred())
@@ -364,7 +371,7 @@ var _ = Describe("RolloutStepGate retry handling", func() {
 
 		f.setStalled(ctx, "RolloutTestFailed", stallAt)
 		f.setTestFailed(ctx, stallAt.Add(-1*time.Minute), false)
-		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
+		f.setKuberikRetry(ctx, retryAt, rolloutv1alpha1.RetryModeRetry)
 
 		for i := 0; i < 3; i++ {
 			_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
@@ -389,7 +396,7 @@ var _ = Describe("RolloutStepGate retry handling", func() {
 
 		f.setStalled(ctx, "RolloutTestFailed", stallAt)
 		f.setTestFailed(ctx, stallAt.Add(-1*time.Minute), true)
-		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeSkip)
+		f.setKuberikRetry(ctx, retryAt, rolloutv1alpha1.RetryModeSkip)
 
 		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
 		Expect(err).NotTo(HaveOccurred())
@@ -422,7 +429,7 @@ var _ = Describe("RolloutStepGate retry handling", func() {
 
 		f.setStalled(ctx, "RolloutTestFailed", stallAt)
 		f.setTestFailed(ctx, stallAt.Add(-1*time.Minute), false)
-		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeSkip)
+		f.setKuberikRetry(ctx, retryAt, rolloutv1alpha1.RetryModeSkip)
 
 		for i := 0; i < 3; i++ {
 			_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
@@ -788,7 +795,7 @@ var _ = Describe("RolloutStepGate step deadline refresh on retry", func() {
 
 		seedStaleDeadline(ctx, stalePast)
 		f.setStalled(ctx, "RolloutTestFailed", stalePast.Add(1*time.Minute))
-		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
+		f.setKuberikRetry(ctx, retryAt, rolloutv1alpha1.RetryModeRetry)
 
 		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
 		Expect(err).NotTo(HaveOccurred())
@@ -823,7 +830,7 @@ var _ = Describe("RolloutStepGate step deadline refresh on retry", func() {
 
 		seedStaleDeadline(ctx, stalePast)
 		f.setStalled(ctx, "RolloutTestFailed", stalePast.Add(1*time.Minute))
-		f.setKuberikRetry(ctx, firstRetry, kuberikrolloutv1alpha1.RetryModeRetry)
+		f.setKuberikRetry(ctx, firstRetry, rolloutv1alpha1.RetryModeRetry)
 
 		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
 		Expect(err).NotTo(HaveOccurred())
@@ -835,7 +842,7 @@ var _ = Describe("RolloutStepGate step deadline refresh on retry", func() {
 		// Simulate a fresh stall after first retry, then another retry with
 		// newer cutoff.
 		f.setStalled(ctx, "RolloutTestFailed", firstRetry.Add(10*time.Second))
-		f.setKuberikRetry(ctx, secondRetry, kuberikrolloutv1alpha1.RetryModeRetry)
+		f.setKuberikRetry(ctx, secondRetry, rolloutv1alpha1.RetryModeRetry)
 
 		_, err = f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
 		Expect(err).NotTo(HaveOccurred())
@@ -876,7 +883,7 @@ var _ = Describe("RolloutTest stale-Stalled guard (retry cutoff)", func() {
 		retryAt := time.Now().Add(-1 * time.Minute)
 
 		f.setStalled(ctx, "KuberikRolloutBakeFailed", stallAt)
-		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
+		f.setKuberikRetry(ctx, retryAt, rolloutv1alpha1.RetryModeRetry)
 		markTestPhase(ctx, rolloutv1alpha1.RolloutTestPhasePending)
 
 		result, err := f.testReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}})
@@ -895,7 +902,7 @@ var _ = Describe("RolloutTest stale-Stalled guard (retry cutoff)", func() {
 		stallAt := time.Now().Add(-5 * time.Second)
 
 		f.setStalled(ctx, "KuberikRolloutBakeFailed", stallAt)
-		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
+		f.setKuberikRetry(ctx, retryAt, rolloutv1alpha1.RetryModeRetry)
 		markTestPhase(ctx, rolloutv1alpha1.RolloutTestPhasePending)
 
 		_, err := f.testReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}})
@@ -926,7 +933,7 @@ var _ = Describe("RolloutTest stale-Stalled guard (retry cutoff)", func() {
 		retryAt := time.Now().Add(-1 * time.Minute)
 
 		f.setStalled(ctx, "KuberikRolloutBakeFailed", stallAt)
-		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
+		f.setKuberikRetry(ctx, retryAt, rolloutv1alpha1.RetryModeRetry)
 
 		// Create a Job owned by the test with the current canary revision label.
 		job := &batchv1.Job{
@@ -970,7 +977,7 @@ var _ = Describe("RolloutTest stale-Stalled guard (retry cutoff)", func() {
 		stallAt := time.Now().Add(-5 * time.Second)
 
 		f.setStalled(ctx, "KuberikRolloutBakeFailed", stallAt)
-		f.setKuberikRetry(ctx, retryAt, kuberikrolloutv1alpha1.RetryModeRetry)
+		f.setKuberikRetry(ctx, retryAt, rolloutv1alpha1.RetryModeRetry)
 
 		job := &batchv1.Job{
 			ObjectMeta: metav1.ObjectMeta{
