@@ -146,12 +146,15 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			log.Error(err, "failed to reset failed RolloutTests during retry")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 		}
-		// Clear the rollouttest.kuberik.com/retry-mode annotation now that we have
-		// acted on this retry. Failure here is logged but non-fatal — a leftover
-		// annotation only affects future retries until the user updates it.
+		// Clear the rollouttest.kuberik.com/retry-mode annotation before clearing
+		// the Stalled condition. Doing it first means a transient failure here
+		// leaves the Stalled condition in place, so the next reconcile re-enters
+		// this branch and retries the cleanup. resetFailedTestsForStep is
+		// idempotent, so re-running it on already-reset tests is safe.
 		if kuberikRollout != nil {
 			if err := clearKuberikRetryModeAnnotation(ctx, r.Client, kuberikRollout); err != nil {
 				log.Error(err, "failed to clear retry-mode annotation on kuberik Rollout")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 			}
 		}
 		// Refresh the step deadline annotations to retryCutoff. Without this, a
