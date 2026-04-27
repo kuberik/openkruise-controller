@@ -1236,6 +1236,95 @@ var _ = Describe("RolloutTest Controller", func() {
 				Expect(readyCondition.Message).To(ContainSubstring("rollout is stalled"))
 			})
 		})
+		It("should NOT overwrite Skipped phase when reconciling while job still has DeletionTimestamp", func() {
+			// Regression test: when the stepgate marks a test Skipped and deletes the
+			// job with background propagation, the job may still be visible (DeletionTimestamp
+			// set but not yet gone). A subsequent reconcile must not overwrite Phase=Skipped
+			// with Phase=Failed derived from the job's terminal state.
+			ctx := context.Background()
+			controllerReconciler := &RolloutTestReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Updating Rollout to step 1, paused")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			rollout.Status.CurrentStepIndex = 1
+			if rollout.Status.CanaryStatus == nil {
+				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+			}
+			rollout.Status.CanaryStatus.CanaryRevision = "v1"
+			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			By("Reconciling - should create job")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying Job was created")
+			var jobs batchv1.JobList
+			Expect(k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": resourceName})).To(Succeed())
+			Expect(jobs.Items).To(HaveLen(1))
+			job := &jobs.Items[0]
+
+			By("Setting job to Failed state")
+			var failedJob batchv1.Job
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: namespace}, &failedJob)).To(Succeed())
+			now := metav1.Now()
+			failedJob.Status.StartTime = &now
+			failedJob.Status.Failed = 1
+			failedJob.Status.Conditions = []batchv1.JobCondition{
+				{
+					Type:               batchv1.JobFailureTarget,
+					Status:             corev1.ConditionTrue,
+					LastProbeTime:      now,
+					LastTransitionTime: now,
+					Reason:             "BackoffLimitExceeded",
+					Message:            "Job has reached the specified backoff limit",
+				},
+				{
+					Type:               batchv1.JobFailed,
+					Status:             corev1.ConditionTrue,
+					LastProbeTime:      now,
+					LastTransitionTime: now,
+					Reason:             "BackoffLimitExceeded",
+					Message:            "Job has reached the specified backoff limit",
+				},
+			}
+			Expect(k8sClient.Status().Update(ctx, &failedJob)).To(Succeed())
+
+			By("Simulating stepgate skip: patch RolloutTest to Skipped")
+			var rt rolloutv1alpha1.RolloutTest
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &rt)).To(Succeed())
+			rt.Status.Phase = rolloutv1alpha1.RolloutTestPhaseSkipped
+			rt.Status.JobName = ""
+			Expect(k8sClient.Status().Update(ctx, &rt)).To(Succeed())
+
+			By("Simulating background deletion: job has DeletionTimestamp but still exists")
+			// Add a finalizer so we can control when the job is actually deleted
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: namespace}, job)).To(Succeed())
+			job.Finalizers = append(job.Finalizers, "test/hold-deletion")
+			Expect(k8sClient.Update(ctx, job)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, job)).To(Succeed())
+
+			By("Verifying job has DeletionTimestamp (background deletion in progress)")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: namespace}, job)).To(Succeed())
+			Expect(job.DeletionTimestamp).NotTo(BeNil())
+
+			By("Reconciling while job still has DeletionTimestamp")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying Phase is still Skipped (not overwritten by job's Failed state)")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &rt)).To(Succeed())
+			Expect(rt.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseSkipped))
+
+			By("Cleanup: remove finalizer to allow job deletion")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: namespace}, job)).To(Succeed())
+			job.Finalizers = []string{}
+			Expect(k8sClient.Update(ctx, job)).To(Succeed())
+		})
+
 		It("should NOT cancel the test if it already Succeeded, even if rollout becomes stalled", func() {
 			ctx := context.Background()
 			controllerReconciler := &RolloutTestReconciler{

@@ -253,6 +253,14 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if rollout.Status.CanaryStatus != nil {
 			currentRevision = rollout.Status.CanaryStatus.CanaryRevision
 		}
+
+		// Job is being deleted (DeletionTimestamp set by background/foreground deletion).
+		// The stepgate already patched the test to the correct terminal phase (Skipped or
+		// WaitingForStep) before issuing the delete. Calling updateStatus here would
+		// derive a new phase from the job's final Failed state and clobber that patch.
+		if job.DeletionTimestamp != nil {
+			return ctrl.Result{}, nil
+		}
 		return r.updateStatus(ctx, &rolloutTest, job, currentRevision)
 	}
 
