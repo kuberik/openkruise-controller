@@ -362,7 +362,7 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// If already ready (annotation set) OR conditions met within deadline
 	// Note: We keep readyAt if it was previously set AND tests are still passing, even if past deadline
 	// The cleanup logic below (lines 300-318) will clear readyAt if tests fail
-	if isStepPaused && allPassed && (deadline.After(now) || readyAtStr != "") {
+	if isStepPaused && allPassed && !bakeFailed && (deadline.After(now) || readyAtStr != "") {
 		// Both conditions are met now or were met previously
 		stepIsReady = true
 		if readyAtStr == "" {
@@ -411,6 +411,8 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 		if !isStepPaused {
 			log.Info("Waiting for step to pause", "step", currentStepIndex)
+		} else if bakeFailed {
+			log.Info("Blocking canary progression: kuberik rollout bake failed", "step", currentStepIndex)
 		} else if !allPassed {
 			log.Info("Waiting for all tests to pass", "step", currentStepIndex)
 		}
@@ -419,20 +421,7 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// Set Stalled at END based on current failure state
 	// Note: Clearing happens at TOP when external changes detected
 	log.V(1).Info("Stalled condition decision point", "bakeFailed", bakeFailed, "anyFailedTests", anyFailedTests, "stepIsReady", stepIsReady, "deadlineExceeded", now.After(deadline))
-	if bakeFailed {
-		log.Info("Kuberik rollout bake failed, setting Stalled condition", "step", currentStepIndex)
-		modified, err := r.setStalledCondition(ctx, &rollout, currentStepIndex, "KuberikRolloutBakeFailed", bakeMessage)
-		if err != nil {
-			log.Error(err, "failed to set Stalled condition (annotation cleanup)")
-			return ctrl.Result{}, err
-		}
-		if modified {
-			if err := r.Status().Update(ctx, &rollout); err != nil {
-				log.Error(err, "failed to set Stalled condition")
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-			}
-		}
-	} else if anyFailedTests {
+	if anyFailedTests {
 		log.Info("Tests failed for step, setting Stalled condition", "step", currentStepIndex)
 		message := fmt.Sprintf("Rollout tests failed for current step (test %s, step %d)", failedTestName, currentStepIndex)
 		modified, err := r.setStalledCondition(ctx, &rollout, currentStepIndex, "RolloutTestFailed", message)
@@ -461,7 +450,7 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 		}
 	} else {
-		// We are not stalled (no bake failure, no test failure, no timeout)
+		// We are not stalled (no test failure, no timeout)
 		// Clear any existing Stalled condition to enable recovery
 		if r.clearStalledCondition(&rollout) {
 			log.Info("Clearing Stalled condition - rollout is healthy")

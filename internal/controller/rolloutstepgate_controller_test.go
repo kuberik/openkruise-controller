@@ -1249,7 +1249,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 		})
 
-		It("should set Stalled condition when kuberik Rollout has failed bake status", func() {
+		It("should block canary progression when kuberik Rollout has failed bake status", func() {
 			ctx := context.Background()
 			controllerReconciler := &RolloutStepGateReconciler{
 				Client: k8sClient,
@@ -1276,7 +1276,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			Expect(foundRollout.Name).To(Equal("test-kuberik-rollout"))
 			Expect(len(foundRollout.Status.History)).To(BeNumerically(">", 0))
 
-			By("Reconciling - should detect failed bake status and set Stalled condition")
+			By("Reconciling - should detect failed bake status and block canary")
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      "test-kruise-rollout",
@@ -1285,23 +1285,20 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Verifying Stalled condition is set")
+			By("Verifying canary step remains paused (not approved)")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kruise-rollout", Namespace: namespace}, kruiseRollout)).To(Succeed())
+			Expect(kruiseRollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).NotTo(BeNil())
+			Expect(*kruiseRollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).To(Equal(int32(3600)))
 
-			var stalledCondition *kruiserolloutv1beta1.RolloutCondition
+			By("Verifying no KuberikRolloutBakeFailed Stalled condition is set")
 			if kruiseRollout.Status.Conditions != nil {
-				for i := range kruiseRollout.Status.Conditions {
-					if kruiseRollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
-						stalledCondition = &kruiseRollout.Status.Conditions[i]
-						break
+				for _, condition := range kruiseRollout.Status.Conditions {
+					if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
+						Expect(condition.Reason).NotTo(Equal("KuberikRolloutBakeFailed"),
+							"bake failure should block canary via gate, not via Stalled condition")
 					}
 				}
 			}
-			Expect(stalledCondition).NotTo(BeNil(), "Stalled condition should be set when kuberik Rollout has failed bake status")
-			Expect(stalledCondition.Status).To(Equal(corev1.ConditionTrue))
-			Expect(stalledCondition.Reason).To(Equal("KuberikRolloutBakeFailed"))
-			Expect(stalledCondition.Message).To(ContainSubstring("test-kuberik-rollout"))
-			Expect(stalledCondition.Message).To(ContainSubstring("failed bake status"))
 		})
 
 		It("should not set Stalled condition when kuberik Rollout has succeeded bake status", func() {
@@ -1353,7 +1350,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			ociRepo.Annotations["rollout.kuberik.com/namespace"] = namespace
 			Expect(k8sClient.Update(ctx, ociRepo)).To(Succeed())
 
-			By("Reconciling - should find kuberik Rollout via OCIRepository and set Stalled condition")
+			By("Reconciling - should find kuberik Rollout via OCIRepository and block canary")
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      "test-kruise-rollout",
@@ -1362,24 +1359,13 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Verifying Stalled condition is set")
+			By("Verifying canary step remains paused (not approved)")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kruise-rollout", Namespace: namespace}, kruiseRollout)).To(Succeed())
-
-			var stalledCondition *kruiserolloutv1beta1.RolloutCondition
-			if kruiseRollout.Status.Conditions != nil {
-				for i := range kruiseRollout.Status.Conditions {
-					if kruiseRollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
-						stalledCondition = &kruiseRollout.Status.Conditions[i]
-						break
-					}
-				}
-			}
-			Expect(stalledCondition).NotTo(BeNil())
-			Expect(stalledCondition.Status).To(Equal(corev1.ConditionTrue))
-			Expect(stalledCondition.Reason).To(Equal("KuberikRolloutBakeFailed"))
+			Expect(kruiseRollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).NotTo(BeNil())
+			Expect(*kruiseRollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).To(Equal(int32(3600)))
 		})
 
-		It("should discover kustomize via labels and set Stalled condition on bake failure", func() {
+		It("should discover kustomize via labels and block canary on bake failure", func() {
 			ctx := context.Background()
 			controllerReconciler := &RolloutStepGateReconciler{
 				Client: k8sClient,
@@ -1403,7 +1389,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			kruiseRollout.Labels["kustomize.toolkit.fluxcd.io/namespace"] = namespace
 			Expect(k8sClient.Update(ctx, kruiseRollout)).To(Succeed())
 
-			By("Reconciling - should discover via labels and set Stalled condition")
+			By("Reconciling - should discover via labels and block canary")
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      "test-kruise-rollout",
@@ -1412,20 +1398,10 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Verifying Stalled condition is set")
+			By("Verifying canary step remains paused (not approved)")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kruise-rollout", Namespace: namespace}, kruiseRollout)).To(Succeed())
-
-			var stalledCondition *kruiserolloutv1beta1.RolloutCondition
-			if kruiseRollout.Status.Conditions != nil {
-				for i := range kruiseRollout.Status.Conditions {
-					if kruiseRollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
-						stalledCondition = &kruiseRollout.Status.Conditions[i]
-						break
-					}
-				}
-			}
-			Expect(stalledCondition).NotTo(BeNil(), "Stalled condition should be set when discovered via labels")
-			Expect(stalledCondition.Reason).To(Equal("KuberikRolloutBakeFailed"))
+			Expect(kruiseRollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).NotTo(BeNil())
+			Expect(*kruiseRollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).To(Equal(int32(3600)))
 		})
 
 		It("should block auto-approval with ready-timeout on bake failure", func() {
