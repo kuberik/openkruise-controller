@@ -60,6 +60,12 @@ const (
 
 	// Large duration to effectively pause indefinitely (max int32, ~68 years in seconds)
 	maxPauseDuration = int32(math.MaxInt32)
+
+	// kuberikBakeHealthyConditionType is a non-standard condition set on the Kruise Rollout
+	// to surface bake-failure blocking state. Unlike the Stalled condition, this does not
+	// trigger the retry machinery — it exists solely for observability when canary progression
+	// is blocked by a kuberik Rollout bake failure.
+	kuberikBakeHealthyConditionType = kruiserolloutv1beta1.RolloutConditionType("KuberikBakeHealthy")
 )
 
 // RolloutStepGateReconciler reconciles Rollout steps with auto-approval logic
@@ -415,30 +421,33 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	// Set Stalled at END based on current failure state
 	// Note: Clearing happens at TOP when external changes detected
+	// KuberikBakeHealthy is updated in each branch alongside Stalled so both
+	// conditions land in a single Status().Update() call.
 	log.V(1).Info("Stalled condition decision point", "bakeFailed", bakeFailed, "anyFailedTests", anyFailedTests, "stepIsReady", stepIsReady, "deadlineExceeded", now.After(deadline))
+	bakeHealthModified := r.syncBakeHealthCondition(&rollout, bakeFailed, bakeMessage)
 	if anyFailedTests {
 		log.Info("Tests failed for step, setting Stalled condition", "step", currentStepIndex)
 		message := fmt.Sprintf("Rollout tests failed for current step (test %s, step %d)", failedTestName, currentStepIndex)
-		modified, err := r.setStalledCondition(ctx, &rollout, currentStepIndex, "RolloutTestFailed", message)
+		stalledModified, err := r.setStalledCondition(ctx, &rollout, currentStepIndex, "RolloutTestFailed", message)
 		if err != nil {
 			log.Error(err, "failed to set Stalled condition (annotation cleanup)")
 			return ctrl.Result{}, err
 		}
-		if modified {
+		if stalledModified || bakeHealthModified {
 			if err := r.Status().Update(ctx, &rollout); err != nil {
 				log.Error(err, "failed to set Stalled condition for failed tests")
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 			}
 		}
-	} else if !stepIsReady && now.After(deadline) {
+	} else if !stepIsReady && !bakeFailed && now.After(deadline) {
 		log.Info("Step ready-timeout exceeded, keeping paused", "step", currentStepIndex, "deadline", deadline)
 		message := fmt.Sprintf("Step %d step-ready-timeout (%v) exceeded at %v for canary %s. Rollout is paused and requires manual intervention.", currentStepIndex, readyTimeout, deadline.Format(time.RFC3339), currentRevision)
-		modified, err := r.setStalledCondition(ctx, &rollout, currentStepIndex, "StepReadyTimeoutExceeded", message)
+		stalledModified, err := r.setStalledCondition(ctx, &rollout, currentStepIndex, "StepReadyTimeoutExceeded", message)
 		if err != nil {
 			log.Error(err, "failed to set Stalled condition (annotation cleanup)")
 			return ctrl.Result{}, err
 		}
-		if modified {
+		if stalledModified || bakeHealthModified {
 			if err := r.Status().Update(ctx, &rollout); err != nil {
 				log.Error(err, "failed to set Stalled condition")
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
@@ -447,15 +456,17 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	} else {
 		// We are not stalled (no test failure, no timeout)
 		// Clear any existing Stalled condition to enable recovery
-		if r.clearStalledCondition(&rollout) {
+		stalledCleared := r.clearStalledCondition(&rollout)
+		if stalledCleared {
 			log.Info("Clearing Stalled condition - rollout is healthy")
+		}
+		if stalledCleared || bakeHealthModified {
 			if err := r.Status().Update(ctx, &rollout); err != nil {
-				log.Error(err, "failed to clear Stalled condition")
+				log.Error(err, "failed to update Stalled/BakeHealthy conditions")
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 			}
 		}
 	}
-	// Note: We don't clear here when healthy - clearing only happens at TOP when context changes
 
 	// Determine Result
 	if anyFailed {
@@ -750,6 +761,46 @@ func (r *RolloutStepGateReconciler) clearStalledCondition(rollout *kruiserollout
 	return true
 }
 
+// syncBakeHealthCondition updates the KuberikBakeHealthy condition in-memory.
+// When failed=true, sets Status=False with the provided message.
+// When failed=false, sets Status=True (healthy/absent-by-default is not used here
+// so monitors always see a definitive value).
+// Returns true if the condition was modified and a status update is needed.
+func (r *RolloutStepGateReconciler) syncBakeHealthCondition(rollout *kruiserolloutv1beta1.Rollout, failed bool, message string) bool {
+	now := metav1.Now()
+	status := corev1.ConditionTrue
+	reason := "BakeHealthy"
+	msg := "Kuberik Rollout bake is healthy"
+	if failed {
+		status = corev1.ConditionFalse
+		reason = "BakeFailed"
+		msg = message
+	}
+	for i := range rollout.Status.Conditions {
+		if rollout.Status.Conditions[i].Type == kuberikBakeHealthyConditionType {
+			if rollout.Status.Conditions[i].Status == status &&
+				rollout.Status.Conditions[i].Message == msg {
+				return false
+			}
+			rollout.Status.Conditions[i].Status = status
+			rollout.Status.Conditions[i].Reason = reason
+			rollout.Status.Conditions[i].Message = msg
+			rollout.Status.Conditions[i].LastTransitionTime = now
+			rollout.Status.Conditions[i].LastUpdateTime = now
+			return true
+		}
+	}
+	rollout.Status.Conditions = append(rollout.Status.Conditions, kruiserolloutv1beta1.RolloutCondition{
+		Type:               kuberikBakeHealthyConditionType,
+		Status:             status,
+		Reason:             reason,
+		Message:            msg,
+		LastTransitionTime: now,
+		LastUpdateTime:     now,
+	})
+	return true
+}
+
 // getKuberikRetryCutoff returns the linked kuberik Rollout, its LastRetryTimestamp,
 // and the retry mode (read from the rollouttest.kuberik.com/retry-mode annotation).
 // cutoff is nil when no retry has been recorded. mode defaults to "retry" when the
@@ -832,8 +883,6 @@ func retryModeFromAnnotation(rollout *kuberikrolloutv1alpha1.Rollout) string {
 // are not at risk of being overwritten the way a MergeFrom diff could be.
 //
 // Idempotent against the in-memory copy: returns nil when the annotation is absent.
-// If the API server reports the path missing (another reconcile already cleared it),
-// the resulting Invalid error is treated as success.
 func clearKuberikRetryModeAnnotation(ctx context.Context, c client.Client, rollout *kuberikrolloutv1alpha1.Rollout) error {
 	if _, has := rollout.Annotations[rolloutv1alpha1.RetryModeAnnotation]; !has {
 		return nil
@@ -842,13 +891,7 @@ func clearKuberikRetryModeAnnotation(ctx context.Context, c client.Client, rollo
 	escaped := strings.ReplaceAll(rolloutv1alpha1.RetryModeAnnotation, "~", "~0")
 	escaped = strings.ReplaceAll(escaped, "/", "~1")
 	patch := []byte(fmt.Sprintf(`[{"op":"remove","path":"/metadata/annotations/%s"}]`, escaped))
-	if err := c.Patch(ctx, rollout, client.RawPatch(types.JSONPatchType, patch)); err != nil {
-		if apierrors.IsInvalid(err) {
-			return nil
-		}
-		return err
-	}
-	return nil
+	return c.Patch(ctx, rollout, client.RawPatch(types.JSONPatchType, patch))
 }
 
 // stalledBefore reports whether the Kruise Rollout currently has a Stalled=True
@@ -943,7 +986,7 @@ func (r *RolloutStepGateReconciler) resetFailedTestsForStep(ctx context.Context,
 			now := metav1.Now()
 			msg := "Test skipped via retry annotation (mode=skip)"
 			meta.SetStatusCondition(&test.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
+				Type:               rolloutv1alpha1.RolloutTestConditionReady,
 				Status:             metav1.ConditionTrue,
 				ObservedGeneration: test.Generation,
 				Reason:             "TestSkipped",
@@ -951,7 +994,7 @@ func (r *RolloutStepGateReconciler) resetFailedTestsForStep(ctx context.Context,
 				LastTransitionTime: now,
 			})
 			meta.SetStatusCondition(&test.Status.Conditions, metav1.Condition{
-				Type:               "Failed",
+				Type:               rolloutv1alpha1.RolloutTestConditionFailed,
 				Status:             metav1.ConditionFalse,
 				ObservedGeneration: test.Generation,
 				Reason:             "TestSkipped",
@@ -959,7 +1002,7 @@ func (r *RolloutStepGateReconciler) resetFailedTestsForStep(ctx context.Context,
 				LastTransitionTime: now,
 			})
 			meta.SetStatusCondition(&test.Status.Conditions, metav1.Condition{
-				Type:               "Stalled",
+				Type:               rolloutv1alpha1.RolloutTestConditionStalled,
 				Status:             metav1.ConditionFalse,
 				ObservedGeneration: test.Generation,
 				Reason:             "TestSkipped",
@@ -1000,9 +1043,9 @@ func isStaleFailedTest(test *rolloutv1alpha1.RolloutTest, retryCutoff *metav1.Ti
 		test.Status.Phase != rolloutv1alpha1.RolloutTestPhaseCancelled {
 		return false
 	}
-	cond := meta.FindStatusCondition(test.Status.Conditions, "Failed")
+	cond := meta.FindStatusCondition(test.Status.Conditions, rolloutv1alpha1.RolloutTestConditionFailed)
 	if cond == nil {
-		cond = meta.FindStatusCondition(test.Status.Conditions, "Ready")
+		cond = meta.FindStatusCondition(test.Status.Conditions, rolloutv1alpha1.RolloutTestConditionReady)
 	}
 	if cond == nil {
 		// No condition to anchor transition time; be conservative and treat

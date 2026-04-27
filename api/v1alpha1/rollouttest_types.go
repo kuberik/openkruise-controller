@@ -83,6 +83,15 @@ const (
 	RetryModeSkip = "skip"
 )
 
+const (
+	// RolloutTestConditionReady is the condition type that indicates overall readiness.
+	RolloutTestConditionReady = "Ready"
+	// RolloutTestConditionFailed is the condition type that indicates the test has failed.
+	RolloutTestConditionFailed = "Failed"
+	// RolloutTestConditionStalled is the condition type that indicates the test is stalled.
+	RolloutTestConditionStalled = "Stalled"
+)
+
 // RolloutTestStatus defines the observed state of RolloutTest.
 type RolloutTestStatus struct {
 	// Conditions store the status conditions of the RolloutTest.

@@ -159,7 +159,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				// Update conditions to reflect cancellation
 				// Ready is True because cancellation is a final state - nothing more to do
 				meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-					Type:               "Ready",
+					Type:               rolloutv1alpha1.RolloutTestConditionReady,
 					Status:             metav1.ConditionTrue,
 					ObservedGeneration: rolloutTest.Generation,
 					Reason:             "JobCancelled",
@@ -167,7 +167,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					LastTransitionTime: metav1.Now(),
 				})
 				meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-					Type:               "Failed",
+					Type:               rolloutv1alpha1.RolloutTestConditionFailed,
 					Status:             metav1.ConditionFalse,
 					ObservedGeneration: rolloutTest.Generation,
 					Reason:             "JobCancelled",
@@ -175,7 +175,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					LastTransitionTime: metav1.Now(),
 				})
 				meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-					Type:               "Stalled",
+					Type:               rolloutv1alpha1.RolloutTestConditionStalled,
 					Status:             metav1.ConditionFalse,
 					ObservedGeneration: rolloutTest.Generation,
 					Reason:             "JobCancelled",
@@ -190,10 +190,10 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			} else {
 				// Test is in terminal state (Succeeded/Failed), preserve phase but clear Stalled condition
 				// The step has moved forward, so the test is no longer blocking progress
-				stalledCondition := meta.FindStatusCondition(rolloutTest.Status.Conditions, "Stalled")
+				stalledCondition := meta.FindStatusCondition(rolloutTest.Status.Conditions, rolloutv1alpha1.RolloutTestConditionStalled)
 				if stalledCondition != nil && stalledCondition.Status == metav1.ConditionTrue {
 					meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-						Type:               "Ready",
+						Type:               rolloutv1alpha1.RolloutTestConditionReady,
 						Status:             metav1.ConditionTrue,
 						ObservedGeneration: rolloutTest.Generation,
 						Reason:             "StepAdvanced",
@@ -201,7 +201,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 						LastTransitionTime: metav1.Now(),
 					})
 					meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-						Type:               "Stalled",
+						Type:               rolloutv1alpha1.RolloutTestConditionStalled,
 						Status:             metav1.ConditionFalse,
 						ObservedGeneration: rolloutTest.Generation,
 						Reason:             "StepAdvanced",
@@ -269,14 +269,14 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if rollout.Status.CurrentStepIndex != rolloutTest.Spec.StepIndex &&
 		(rolloutTest.Status.Phase == rolloutv1alpha1.RolloutTestPhaseSucceeded ||
 			rolloutTest.Status.Phase == rolloutv1alpha1.RolloutTestPhaseFailed) {
-		stalledCondition := meta.FindStatusCondition(rolloutTest.Status.Conditions, "Stalled")
+		stalledCondition := meta.FindStatusCondition(rolloutTest.Status.Conditions, rolloutv1alpha1.RolloutTestConditionStalled)
 		if stalledCondition != nil && stalledCondition.Status == metav1.ConditionTrue {
 			log.Info("Step advanced past terminal test, clearing Stalled condition",
 				"currentStep", rollout.Status.CurrentStepIndex,
 				"testStep", rolloutTest.Spec.StepIndex,
 				"phase", rolloutTest.Status.Phase)
 			meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
+				Type:               rolloutv1alpha1.RolloutTestConditionReady,
 				Status:             metav1.ConditionTrue,
 				ObservedGeneration: rolloutTest.Generation,
 				Reason:             "StepAdvanced",
@@ -284,7 +284,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				LastTransitionTime: metav1.Now(),
 			})
 			meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-				Type:               "Stalled",
+				Type:               rolloutv1alpha1.RolloutTestConditionStalled,
 				Status:             metav1.ConditionFalse,
 				ObservedGeneration: rolloutTest.Generation,
 				Reason:             "StepAdvanced",
@@ -359,7 +359,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 				message := "Test job creation skipped because rollout is stalled"
 				meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-					Type:               "Ready",
+					Type:               rolloutv1alpha1.RolloutTestConditionReady,
 					Status:             metav1.ConditionTrue,
 					ObservedGeneration: rolloutTest.Generation,
 					Reason:             "JobCancelled",
@@ -367,7 +367,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					LastTransitionTime: metav1.Now(),
 				})
 				meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-					Type:               "Failed",
+					Type:               rolloutv1alpha1.RolloutTestConditionFailed,
 					Status:             metav1.ConditionFalse,
 					ObservedGeneration: rolloutTest.Generation,
 					Reason:             "JobCancelled",
@@ -375,7 +375,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					LastTransitionTime: metav1.Now(),
 				})
 				meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-					Type:               "Stalled",
+					Type:               rolloutv1alpha1.RolloutTestConditionStalled,
 					Status:             metav1.ConditionFalse,
 					ObservedGeneration: rolloutTest.Generation,
 					Reason:             "JobCancelled",
@@ -561,7 +561,7 @@ func (r *RolloutTestReconciler) updateStatus(ctx context.Context, rolloutTest *r
 
 	// Update conditions
 	meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-		Type:               "Ready",
+		Type:               rolloutv1alpha1.RolloutTestConditionReady,
 		Status:             readyStatus,
 		ObservedGeneration: rolloutTest.Generation,
 		Reason:             reason,
@@ -571,7 +571,7 @@ func (r *RolloutTestReconciler) updateStatus(ctx context.Context, rolloutTest *r
 
 	if phase == rolloutv1alpha1.RolloutTestPhaseFailed {
 		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-			Type:               "Failed",
+			Type:               rolloutv1alpha1.RolloutTestConditionFailed,
 			Status:             metav1.ConditionTrue,
 			ObservedGeneration: rolloutTest.Generation,
 			Reason:             reason,
@@ -579,7 +579,7 @@ func (r *RolloutTestReconciler) updateStatus(ctx context.Context, rolloutTest *r
 			LastTransitionTime: metav1.Now(),
 		})
 		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-			Type:               "Stalled",
+			Type:               rolloutv1alpha1.RolloutTestConditionStalled,
 			Status:             metav1.ConditionTrue,
 			ObservedGeneration: rolloutTest.Generation,
 			Reason:             reason,
@@ -588,7 +588,7 @@ func (r *RolloutTestReconciler) updateStatus(ctx context.Context, rolloutTest *r
 		})
 	} else {
 		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-			Type:               "Failed",
+			Type:               rolloutv1alpha1.RolloutTestConditionFailed,
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: rolloutTest.Generation,
 			Reason:             reason,
@@ -596,7 +596,7 @@ func (r *RolloutTestReconciler) updateStatus(ctx context.Context, rolloutTest *r
 			LastTransitionTime: metav1.Now(),
 		})
 		meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
-			Type:               "Stalled",
+			Type:               rolloutv1alpha1.RolloutTestConditionStalled,
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: rolloutTest.Generation,
 			Reason:             reason,
