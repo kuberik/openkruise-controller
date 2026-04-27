@@ -129,7 +129,7 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	bakeFailed, bakeMessage, err := r.getBakeFailureStatus(ctx, &rollout)
 	if err != nil {
 		log.Error(err, "failed to check kuberik rollout bake status")
-		// Non-fatal, continue with normal flow
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 	}
 	log.V(1).Info("Bake status check", "bakeFailed", bakeFailed, "message", bakeMessage)
 
@@ -142,7 +142,7 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	kuberikRollout, retryCutoff, retryMode, err := r.getKuberikRetryCutoff(ctx, &rollout)
 	if err != nil {
 		log.Error(err, "failed to fetch kuberik rollout retry timestamp")
-		// Non-fatal, continue
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 	}
 	if retryCutoff != nil && r.stalledBefore(&rollout, retryCutoff) {
 		log.Info("Retry detected, resetting failed RolloutTests and clearing Stalled",
