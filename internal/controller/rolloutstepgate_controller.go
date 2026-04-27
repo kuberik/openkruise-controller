@@ -57,9 +57,6 @@ const (
 	internalAnnotationStepLastRevisionPrefix = "internal.rollout.kuberik.io/step-%d-last-revision"
 	// Store the last step index we processed (to detect step changes)
 	internalAnnotationLastStepIndex = "internal.rollout.kuberik.io/last-step-index"
-	// Set when a retry/skip acknowledges a bake failure for the current step.
-	// Suppresses bakeFailed in the gate until the step advances or a new revision starts.
-	internalAnnotationStepBakeAckedPrefix = "internal.rollout.kuberik.io/step-%d-bake-acked"
 
 	// Large duration to effectively pause indefinitely (max int32, ~68 years in seconds)
 	maxPauseDuration = int32(math.MaxInt32)
@@ -74,7 +71,7 @@ type RolloutStepGateReconciler struct {
 // +kubebuilder:rbac:groups=rollouts.kruise.io,resources=rollouts,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=rollouts.kruise.io,resources=rollouts/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=rollout.kuberik.com,resources=rollouttests,verbs=get;list;watch
-// +kubebuilder:rbac:groups=kuberik.com,resources=rollouts,verbs=get;list;watch
+// +kubebuilder:rbac:groups=kuberik.com,resources=rollouts,verbs=get;list;watch;patch;update
 // +kubebuilder:rbac:groups=kustomize.toolkit.fluxcd.io,resources=kustomizations,verbs=get;list;watch
 // +kubebuilder:rbac:groups=source.toolkit.fluxcd.io,resources=ocirepositories,verbs=get;list;watch
 
@@ -128,20 +125,7 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		log.Error(err, "failed to check kuberik rollout bake status")
 		// Non-fatal, continue with normal flow
 	}
-	// bakeFailedOriginal captures the raw result before any suppression so that
-	// the retry block can decide whether to record an acknowledgment.
-	bakeFailedOriginal := bakeFailed
 	log.V(1).Info("Bake status check", "bakeFailed", bakeFailed, "message", bakeMessage)
-
-	// Suppress bake failure if it was previously acknowledged by a retry/skip.
-	// The acknowledgment persists until the step advances or a new revision starts
-	// (both paths call cleanupStepAnnotations which removes this annotation).
-	bakeAckedStr := r.getStepAnnotation(&rollout, currentStepIndex, internalAnnotationStepBakeAckedPrefix)
-	if bakeAckedStr != "" && bakeFailed {
-		log.V(1).Info("Bake failure suppressed: acknowledged by retry", "step", currentStepIndex, "ackedAt", bakeAckedStr)
-		bakeFailed = false
-		bakeMessage = ""
-	}
 
 	// Determine retry cutoff from the matching kuberik Rollout. If a retry was
 	// requested more recently than the Stalled condition was set, unwind the
@@ -154,9 +138,6 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		log.Error(err, "failed to fetch kuberik rollout retry timestamp")
 		// Non-fatal, continue
 	}
-	// bakeNeedsAck is true when a retry was triggered while bake was failing and
-	// the failure has not yet been acknowledged (no bake-acked annotation set).
-	bakeNeedsAck := retryCutoff != nil && bakeFailedOriginal && bakeAckedStr == ""
 	if retryCutoff != nil && r.stalledBefore(&rollout, retryCutoff) {
 		log.Info("Retry detected, resetting failed RolloutTests and clearing Stalled",
 			"retryCutoff", retryCutoff.Format(time.RFC3339),
@@ -186,17 +167,7 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			log.Error(err, "failed to refresh step deadline during retry")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 		}
-		// If bake was failing when the retry was triggered, record an acknowledgment
-		// so subsequent reconciles (e.g. while waiting for step-bake-time) keep
-		// bakeFailed=false and don't re-block the gate.
-		if bakeNeedsAck {
-			if err := r.setStepAnnotation(ctx, &rollout, currentStepIndex, internalAnnotationStepBakeAckedPrefix, retryCutoff.Format(time.RFC3339)); err != nil {
-				log.Error(err, "failed to set bake-acked annotation")
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-			}
-		}
-		// Refetch after the annotation update so clearStalledCondition sees the
-		// latest resource version.
+		// Refetch so clearStalledCondition sees the latest resource version.
 		if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -206,29 +177,10 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 			}
 		}
-		// Re-evaluate bake failure: after the retry the kuberik rollout should
-		// have moved out of Failed, so bakeFailed is likely false now.
-		bakeFailed = false
-		bakeMessage = ""
 		// Refetch to get a clean status view for the remainder of the reconcile.
 		if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
 			return ctrl.Result{}, err
 		}
-	} else if bakeNeedsAck {
-		// Bake was failing and a retry was triggered, but there was no Stalled
-		// condition (bake-only failure: tests all passed). Acknowledge the bake
-		// failure so the gate can open for this retry.
-		log.Info("Retry detected with bake failure but no stall, acknowledging bake failure",
-			"retryCutoff", retryCutoff.Format(time.RFC3339))
-		if err := r.setStepAnnotation(ctx, &rollout, currentStepIndex, internalAnnotationStepBakeAckedPrefix, retryCutoff.Format(time.RFC3339)); err != nil {
-			log.Error(err, "failed to set bake-acked annotation")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-		}
-		if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
-			return ctrl.Result{}, err
-		}
-		bakeFailed = false
-		bakeMessage = ""
 	}
 
 	// Handle revision annotation updates
@@ -595,12 +547,6 @@ func (r *RolloutStepGateReconciler) cleanupStepAnnotations(ctx context.Context, 
 		updated = true
 	}
 
-	bakeAckedKey := fmt.Sprintf(internalAnnotationStepBakeAckedPrefix, stepIndex)
-	if _, exists := rollout.Annotations[bakeAckedKey]; exists {
-		delete(rollout.Annotations, bakeAckedKey)
-		updated = true
-	}
-
 	if updated {
 		return r.Update(ctx, rollout)
 	}
@@ -619,7 +565,6 @@ func (r *RolloutStepGateReconciler) cleanupStepAnnotationsForOtherSteps(ctx cont
 		internalAnnotationStepStartedAtPrefix,
 		internalAnnotationStepReadyAtPrefix,
 		internalAnnotationStepLastRevisionPrefix,
-		internalAnnotationStepBakeAckedPrefix,
 	}
 
 	// Iterate through a reasonable range of step indices to find and remove annotations for other steps
