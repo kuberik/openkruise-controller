@@ -1481,26 +1481,28 @@ var _ = Describe("RolloutStepGate Controller", func() {
 				},
 			}
 			rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{
-				CurrentStepIndex: 1,
-				CanaryRevision:   "v1",
-				CurrentStepState: "StepPaused",
+				CommonStatus: kruiserolloutv1beta1.CommonStatus{
+					CurrentStepIndex: 1,
+					CurrentStepState: "StepPaused",
+				},
+				CanaryRevision: "v1",
 			}
 
-			base := fake.NewClientBuilder().
-				WithScheme(scheme.Scheme).
-				WithObjects(rollout).
-				Build()
 			// Intercept Kustomization Gets to simulate a transient API error.
 			// This is the first external lookup in both getBakeFailureStatus and
 			// getKuberikRetryCutoff; the fix ensures either failure causes a requeue.
-			errClient := client.WithInterceptorFuncs(base, interceptor.Funcs{
-				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-					if _, ok := obj.(*kustomizev1.Kustomization); ok {
-						return fmt.Errorf("connection refused")
-					}
-					return c.Get(ctx, key, obj, opts...)
-				},
-			})
+			errClient := fake.NewClientBuilder().
+				WithScheme(scheme.Scheme).
+				WithObjects(rollout).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+						if _, ok := obj.(*kustomizev1.Kustomization); ok {
+							return fmt.Errorf("connection refused")
+						}
+						return c.Get(ctx, key, obj, opts...)
+					},
+				}).
+				Build()
 
 			reconciler := &RolloutStepGateReconciler{
 				Client: errClient,
