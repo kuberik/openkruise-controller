@@ -18,11 +18,14 @@ rules:
   - watch
 - apiGroups:
   - kuberik.com
+  - rollouts.kruise.io
   resources:
   - rollouts
   verbs:
   - get
   - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - kustomize.toolkit.fluxcd.io
@@ -58,16 +61,6 @@ rules:
   - get
   - patch
   - update
-- apiGroups:
-  - rollouts.kruise.io
-  resources:
-  - rollouts
-  verbs:
-  - get
-  - list
-  - patch
-  - update
-  - watch
 - apiGroups:
   - rollouts.kruise.io
   resources:
