@@ -941,9 +941,10 @@ func (r *RolloutStepGateReconciler) resetStepDeadlineForRetry(ctx context.Contex
 
 // resetFailedTestsForStep handles stale-failed RolloutTests for the given step.
 // Behavior depends on retryMode:
-//   "skip": mark the test as Skipped (treated as passing).
-//   otherwise (retry): reset phase to WaitingForStep so a fresh job is created on
-//           next reconcile.
+//
+//	"skip": mark the test as Skipped (treated as passing).
+//	otherwise (retry): reset phase to WaitingForStep so a fresh job is created on
+//	        next reconcile.
 //
 // Both modes delete the owned Job: keeping a stale Job around allows
 // RolloutTestReconciler.updateStatus to later overwrite our Phase patch with a
@@ -1155,6 +1156,7 @@ func (r *RolloutStepGateReconciler) findKuberikRolloutForKustomization(ctx conte
 //  1. Kustomization annotations for rollout references (rollout.kuberik.com/substitute.*.from).
 //  2. The OCIRepository that the Kustomization references (rollout.kuberik.com/name or other
 //     rollout.kuberik.com/* annotations).
+//
 // Returns (nil, nil) when the linkage is missing — a normal, non-error outcome.
 func findKuberikRolloutForKustomization(ctx context.Context, c client.Client, kustomization *kustomizev1.Kustomization) (*kuberikrolloutv1alpha1.Rollout, error) {
 	log := logf.FromContext(ctx)
