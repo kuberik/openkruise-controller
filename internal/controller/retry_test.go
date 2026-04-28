@@ -941,8 +941,8 @@ var _ = Describe("RolloutTest stale-Stalled guard (retry cutoff)", func() {
 				Name:      "app-test-job",
 				Namespace: f.ns,
 				Labels: map[string]string{
-					"rollout-test":                         f.rolloutTest.Name,
-					"rollout.kuberik.io/canary-revision":   "rev-1",
+					"rollout-test":                       f.rolloutTest.Name,
+					"rollout.kuberik.io/canary-revision": "rev-1",
 				},
 			},
 			Spec: f.rolloutTest.Spec.JobTemplate,
@@ -984,8 +984,8 @@ var _ = Describe("RolloutTest stale-Stalled guard (retry cutoff)", func() {
 				Name:      "app-test-job-fresh",
 				Namespace: f.ns,
 				Labels: map[string]string{
-					"rollout-test":                         f.rolloutTest.Name,
-					"rollout.kuberik.io/canary-revision":   "rev-1",
+					"rollout-test":                       f.rolloutTest.Name,
+					"rollout.kuberik.io/canary-revision": "rev-1",
 				},
 			},
 			Spec: f.rolloutTest.Spec.JobTemplate,

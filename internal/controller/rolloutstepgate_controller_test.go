@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -13,7 +14,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/cli-utils/pkg/kstatus/status"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
@@ -1285,10 +1290,22 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Verifying canary step remains paused (not approved)")
+			By("Verifying canary step is not approved (step-ready-at annotation absent)")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kruise-rollout", Namespace: namespace}, kruiseRollout)).To(Succeed())
-			Expect(kruiseRollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).NotTo(BeNil())
-			Expect(*kruiseRollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).To(Equal(int32(3600)))
+			Expect(kruiseRollout.Annotations).NotTo(HaveKey("internal.rollout.kuberik.io/step-1-ready-at"),
+				"bake failure should prevent gate from setting step-ready-at")
+
+			By("Verifying KuberikBakeHealthy=False condition is set")
+			var bakeHealthy *kruiserolloutv1beta1.RolloutCondition
+			for i := range kruiseRollout.Status.Conditions {
+				if kruiseRollout.Status.Conditions[i].Type == kruiserolloutv1beta1.RolloutConditionType("KuberikBakeHealthy") {
+					bakeHealthy = &kruiseRollout.Status.Conditions[i]
+					break
+				}
+			}
+			Expect(bakeHealthy).NotTo(BeNil(), "KuberikBakeHealthy condition should be set on bake failure")
+			Expect(bakeHealthy.Status).To(Equal(corev1.ConditionFalse))
+			Expect(bakeHealthy.Reason).To(Equal("BakeFailed"))
 
 			By("Verifying no KuberikRolloutBakeFailed Stalled condition is set")
 			if kruiseRollout.Status.Conditions != nil {
@@ -1359,10 +1376,10 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Verifying canary step remains paused (not approved)")
+			By("Verifying canary step is not approved (step-ready-at annotation absent)")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kruise-rollout", Namespace: namespace}, kruiseRollout)).To(Succeed())
-			Expect(kruiseRollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).NotTo(BeNil())
-			Expect(*kruiseRollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).To(Equal(int32(3600)))
+			Expect(kruiseRollout.Annotations).NotTo(HaveKey("internal.rollout.kuberik.io/step-1-ready-at"),
+				"bake failure should prevent gate from setting step-ready-at")
 		})
 
 		It("should discover kustomize via labels and block canary on bake failure", func() {
@@ -1398,10 +1415,10 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Verifying canary step remains paused (not approved)")
+			By("Verifying canary step is not approved (step-ready-at annotation absent)")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kruise-rollout", Namespace: namespace}, kruiseRollout)).To(Succeed())
-			Expect(kruiseRollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).NotTo(BeNil())
-			Expect(*kruiseRollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).To(Equal(int32(3600)))
+			Expect(kruiseRollout.Annotations).NotTo(HaveKey("internal.rollout.kuberik.io/step-1-ready-at"),
+				"bake failure should prevent gate from setting step-ready-at")
 		})
 
 		It("should block auto-approval with ready-timeout on bake failure", func() {
@@ -1426,10 +1443,79 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Verifying rollout remains paused")
+			By("Verifying canary step is not approved (step-ready-at annotation absent)")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kruise-rollout", Namespace: namespace}, kruiseRollout)).To(Succeed())
-			Expect(kruiseRollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).NotTo(BeNil())
-			Expect(*kruiseRollout.Spec.Strategy.Canary.Steps[0].Pause.Duration).To(Equal(int32(3600)))
+			Expect(kruiseRollout.Annotations).NotTo(HaveKey("internal.rollout.kuberik.io/step-1-ready-at"),
+				"bake failure should prevent gate from setting step-ready-at")
+		})
+	})
+
+	// These tests verify that transient API errors in the kustomize/kuberik lookups
+	// are treated as fatal (return error + requeue) rather than silently continuing.
+	// Prior to the fix, both getBakeFailureStatus and getKuberikRetryCutoff errors
+	// were swallowed, which could allow incorrect gate decisions.
+	var _ = Describe("RolloutStepGate lookup error handling", func() {
+		It("returns error with 5s requeue when kustomization lookup fails", func() {
+			ctx := context.Background()
+
+			rollout := &kruiserolloutv1beta1.Rollout{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "err-rollout",
+					Namespace: "default",
+					Labels: map[string]string{
+						"kustomize.toolkit.fluxcd.io/name":      "my-ks",
+						"kustomize.toolkit.fluxcd.io/namespace": "default",
+					},
+				},
+				Spec: kruiserolloutv1beta1.RolloutSpec{
+					WorkloadRef: kruiserolloutv1beta1.ObjectRef{
+						APIVersion: "apps/v1", Kind: "Deployment", Name: "test",
+					},
+					Strategy: kruiserolloutv1beta1.RolloutStrategy{
+						Canary: &kruiserolloutv1beta1.CanaryStrategy{
+							Steps: []kruiserolloutv1beta1.CanaryStep{
+								{Replicas: &intstr.IntOrString{Type: intstr.Int, IntVal: 1}},
+							},
+						},
+					},
+				},
+			}
+			rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{
+				CommonStatus: kruiserolloutv1beta1.CommonStatus{
+					CurrentStepIndex: 1,
+					CurrentStepState: "StepPaused",
+				},
+				CanaryRevision: "v1",
+			}
+
+			// Intercept Kustomization Gets to simulate a transient API error.
+			// This is the first external lookup in both getBakeFailureStatus and
+			// getKuberikRetryCutoff; the fix ensures either failure causes a requeue.
+			errClient := fake.NewClientBuilder().
+				WithScheme(scheme.Scheme).
+				WithObjects(rollout).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+						if _, ok := obj.(*kustomizev1.Kustomization); ok {
+							return fmt.Errorf("connection refused")
+						}
+						return c.Get(ctx, key, obj, opts...)
+					},
+				}).
+				Build()
+
+			reconciler := &RolloutStepGateReconciler{
+				Client: errClient,
+				Scheme: scheme.Scheme,
+			}
+
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "err-rollout", Namespace: "default"},
+			})
+
+			Expect(err).To(HaveOccurred(), "API error must be propagated, not swallowed")
+			Expect(result.RequeueAfter).To(Equal(5*time.Second),
+				"controller must schedule a requeue so the error is retried")
 		})
 	})
 })
