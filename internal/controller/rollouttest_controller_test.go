@@ -1154,6 +1154,24 @@ var _ = Describe("RolloutTest Controller", func() {
 				Expect(readyCondition.Status).To(Equal(metav1.ConditionTrue))
 				Expect(readyCondition.Reason).To(Equal("JobCancelled"))
 				Expect(readyCondition.Message).To(ContainSubstring("skipped because rollout is stalled"))
+
+				By("Verifying ObservedCanaryRevision is stamped so a new revision can trigger reset")
+				Expect(rt.Status.ObservedCanaryRevision).To(Equal("v1"))
+
+				By("Simulating a new kruise rollout with a different canary revision")
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+				rollout.Status.CanaryStatus.CanaryRevision = "v2"
+				rollout.Status.Conditions = nil
+				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+				By("Reconciling - should reset test to WaitingForStep")
+				_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				Expect(err).NotTo(HaveOccurred())
+
+				Expect(k8sClient.Get(ctx, typeNamespacedName, &rt)).To(Succeed())
+				Expect(rt.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseWaitingForStep))
+				Expect(rt.Status.ObservedCanaryRevision).To(BeEmpty())
+				Expect(rt.Status.Conditions).To(BeEmpty())
 			})
 
 			It("should cancel the test if rollout becomes stalled", func() {

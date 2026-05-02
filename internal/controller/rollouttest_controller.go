@@ -356,6 +356,13 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				rolloutTest.Status.Phase != rolloutv1alpha1.RolloutTestPhaseWaitingForStep {
 				rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseCancelled
 				rolloutTest.Status.JobName = ""
+				// Record the revision so the reset check at the top of the loop
+				// fires when a new canary revision appears (no job was ever created
+				// so ObservedCanaryRevision would otherwise stay empty and the reset
+				// would never trigger).
+				if currentRevision != "" {
+					rolloutTest.Status.ObservedCanaryRevision = currentRevision
+				}
 
 				message := "Test job creation skipped because rollout is stalled"
 				meta.SetStatusCondition(&rolloutTest.Status.Conditions, metav1.Condition{
