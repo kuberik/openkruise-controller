@@ -851,6 +851,98 @@ var _ = Describe("RolloutStepGate step deadline refresh on retry", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}, second)).To(Succeed())
 		Expect(second.Annotations[stepStartedAtKey]).To(Equal(secondRetry.Format(time.RFC3339)))
 	})
+
+	// Regression for the hello-multi-staging flap: bakeFailed=true reconciles
+	// clear Stalled via the "rollout is healthy" else branch, leaving Stalled=False
+	// at retry time. stalledBefore then returns false and the retry-clear branch is
+	// skipped. step-started-at must still advance and stale Cancelled/Failed tests
+	// must still reset — otherwise the next bakeFailed=false reconcile re-stalls
+	// on the stale deadline, or evaluateTests treats Cancelled tests as
+	// stale-in-progress forever and the step never progresses.
+	It("refreshes step-started-at when Stalled=False at retry time", func() {
+		stalePast := time.Now().Add(-30 * time.Minute)
+		retryAt := time.Now().Add(-2 * time.Minute).Truncate(time.Second)
+
+		seedStaleDeadline(ctx, stalePast)
+		// No setStalled — the rollout has no Stalled=True condition (or a False one).
+		f.setKuberikRetry(ctx, retryAt, rolloutv1alpha1.RetryModeRetry)
+
+		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &kruiserolloutv1beta1.Rollout{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}, updated)).To(Succeed())
+		Expect(updated.Annotations[stepStartedAtKey]).To(Equal(retryAt.Format(time.RFC3339)))
+		Expect(updated.Annotations).NotTo(HaveKey(stepReadyAtKey))
+	})
+
+	// Regression for the bake-timer infinite loop: once step-started-at matches
+	// retryCutoff, subsequent reconciles must NOT clear a legitimately-set
+	// step-ready-at. Before this fix the function deleted ready-at whenever it
+	// was present, restarting the step-bake-time on every reconcile and looping
+	// forever in the "Step ready, waiting for step-bake-time" state.
+	It("does not clobber step-ready-at once step-started-at matches retryCutoff", func() {
+		retryAt := time.Now().Add(-2 * time.Minute).Truncate(time.Second)
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}, f.kruiseRollout)).To(Succeed())
+		if f.kruiseRollout.Annotations == nil {
+			f.kruiseRollout.Annotations = map[string]string{}
+		}
+		// Simulate post-retry steady state: step-started-at already at retryCutoff,
+		// step-ready-at set by the "Step ready for approval" branch.
+		readyAt := time.Now().Truncate(time.Second).Format(time.RFC3339)
+		f.kruiseRollout.Annotations[stepStartedAtKey] = retryAt.Format(time.RFC3339)
+		f.kruiseRollout.Annotations[stepReadyAtKey] = readyAt
+		f.kruiseRollout.Annotations["rollout.kuberik.io/step-1-ready-timeout"] = "10m"
+		// 1h bake-time keeps step paused so the post-bake auto-approval doesn't
+		// fire and unpause the step (which would legitimately clear ready-at).
+		f.kruiseRollout.Annotations["rollout.kuberik.io/step-1-bake-time"] = "1h"
+		f.kruiseRollout.Annotations["internal.rollout.kuberik.io/last-step-index"] = "1"
+		Expect(k8sClient.Update(ctx, f.kruiseRollout)).To(Succeed())
+		// Mark the test as Succeeded so allPassed=true and the "Step no longer ready"
+		// cleanup branch doesn't fire (which would legitimately clear step-ready-at).
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, f.rolloutTest)).To(Succeed())
+		f.rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseSucceeded
+		f.rolloutTest.Status.ObservedCanaryRevision = "rev-1"
+		Expect(k8sClient.Status().Update(ctx, f.rolloutTest)).To(Succeed())
+		f.setKuberikRetry(ctx, retryAt, rolloutv1alpha1.RetryModeRetry)
+
+		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &kruiserolloutv1beta1.Rollout{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}, updated)).To(Succeed())
+		Expect(updated.Annotations[stepStartedAtKey]).To(Equal(retryAt.Format(time.RFC3339)))
+		Expect(updated.Annotations[stepReadyAtKey]).To(Equal(readyAt), "step-ready-at must be preserved once step-started-at is aligned with retryCutoff")
+	})
+
+	It("resets a Cancelled test when Stalled=False at retry time", func() {
+		stalePast := time.Now().Add(-30 * time.Minute)
+		retryAt := time.Now().Add(-2 * time.Minute).Truncate(time.Second)
+
+		seedStaleDeadline(ctx, stalePast)
+		// Mark the test Cancelled with a transition timestamp pre-retry — matches
+		// hello-multi-staging where tests sat Cancelled for days before retry.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, f.rolloutTest)).To(Succeed())
+		f.rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseCancelled
+		f.rolloutTest.Status.Conditions = []metav1.Condition{{
+			Type:               rolloutv1alpha1.RolloutTestConditionFailed,
+			Status:             metav1.ConditionFalse,
+			Reason:             "JobCancelled",
+			Message:            "cancelled pre-retry",
+			LastTransitionTime: metav1.NewTime(stalePast),
+		}}
+		Expect(k8sClient.Status().Update(ctx, f.rolloutTest)).To(Succeed())
+		// No setStalled.
+		f.setKuberikRetry(ctx, retryAt, rolloutv1alpha1.RetryModeRetry)
+
+		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		updatedTest := &rolloutv1alpha1.RolloutTest{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, updatedTest)).To(Succeed())
+		Expect(updatedTest.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseWaitingForStep))
+	})
 })
 
 var _ = Describe("RolloutTest stale-Stalled guard (retry cutoff)", func() {

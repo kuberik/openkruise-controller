@@ -144,39 +144,44 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		log.Error(err, "failed to fetch kuberik rollout retry timestamp")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 	}
-	if retryCutoff != nil && r.stalledBefore(&rollout, retryCutoff) {
-		log.Info("Retry detected, resetting failed RolloutTests and clearing Stalled",
-			"retryCutoff", retryCutoff.Format(time.RFC3339),
-			"mode", retryMode)
-		if err := r.resetFailedTestsForStep(ctx, rollout.Namespace, rollout.Name, currentStepIndex, retryCutoff, retryMode); err != nil {
-			log.Error(err, "failed to reset failed RolloutTests during retry")
+	// Apply retry side-effects unconditionally when a retryCutoff exists. Must run
+	// outside the stalledBefore branch below: when bakeFailed=true drives the
+	// deadline-exceeded → clearStalled feedback loop (line 458 else), Stalled is
+	// False at the moment of retry visibility, so stalledBefore returns false and
+	// the retry branch is skipped. Without unconditional application, step-started-at
+	// stays stale (deadline immediately re-exceeded) and Cancelled/Failed tests
+	// never reset (step never progresses) — both defeat the retry. All three
+	// helpers below are idempotent on stable state:
+	//   - resetStepDeadlineForRetry: no-op when step-started-at already matches retryCutoff.
+	//   - resetFailedTestsForStep: only mutates tests where isStaleFailedTest is true;
+	//     post-reset phase is WaitingForStep/Skipped so the predicate is false.
+	//   - clearKuberikRetryModeAnnotation: no-op when the annotation is absent.
+	// Order is preserved from the original retry branch: tests reset before retry-mode
+	// annotation clear, so a transient failure leaves retry-mode set and the next
+	// reconcile re-enters this block to finish the cleanup.
+	if retryCutoff != nil {
+		if err := r.resetStepDeadlineForRetry(ctx, &rollout, currentStepIndex, retryCutoff); err != nil {
+			log.Error(err, "failed to refresh step deadline for retry")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 		}
-		// Clear the rollouttest.kuberik.com/retry-mode annotation before clearing
-		// the Stalled condition. Doing it first means a transient failure here
-		// leaves the Stalled condition in place, so the next reconcile re-enters
-		// this branch and retries the cleanup. resetFailedTestsForStep is
-		// idempotent, so re-running it on already-reset tests is safe.
+		if err := r.resetFailedTestsForStep(ctx, rollout.Namespace, rollout.Name, currentStepIndex, retryCutoff, retryMode); err != nil {
+			log.Error(err, "failed to reset failed RolloutTests for retry")
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+		}
 		if kuberikRollout != nil {
 			if err := clearKuberikRetryModeAnnotation(ctx, r.Client, kuberikRollout); err != nil {
 				log.Error(err, "failed to clear retry-mode annotation on kuberik Rollout")
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 			}
 		}
-		// Refresh the step deadline annotations to retryCutoff. Without this, a
-		// stale "step-started-at" (from before the retry) can push the step past
-		// its step-ready-timeout window the moment Stalled is cleared, so the
-		// next reconcile re-stalls with StepReadyTimeoutExceeded — defeating the
-		// retry. Using retryCutoff (not time.Now) gives concurrent reconciles a
-		// deterministic anchor.
-		if err := r.resetStepDeadlineForRetry(ctx, &rollout, currentStepIndex, retryCutoff); err != nil {
-			log.Error(err, "failed to refresh step deadline during retry")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-		}
-		// Refetch so clearStalledCondition sees the latest resource version.
 		if err := r.Get(ctx, req.NamespacedName, &rollout); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+	if retryCutoff != nil && r.stalledBefore(&rollout, retryCutoff) {
+		log.Info("Retry postdates Stalled condition, clearing it",
+			"retryCutoff", retryCutoff.Format(time.RFC3339),
+			"mode", retryMode)
 		if r.clearStalledCondition(&rollout) {
 			if err := r.Status().Update(ctx, &rollout); err != nil {
 				log.Error(err, "failed to clear Stalled condition during retry")
@@ -918,8 +923,11 @@ func stalledBefore(rollout *kruiserolloutv1beta1.Rollout, cutoff *metav1.Time) b
 
 // resetStepDeadlineForRetry writes the step-started-at annotation to retryCutoff
 // and clears step-ready-at so the step-ready-timeout window restarts after a
-// retry. Called only in the retry-detected branch; no-op when annotations are
-// already aligned.
+// retry. Called on every reconcile while a retryCutoff is recorded; no-op once
+// step-started-at already matches retryCutoff. ready-at is cleared only on the
+// transition (i.e. when we actually move step-started-at) — clearing it after
+// that would clobber a legitimate ready-at that the post-retry flow set when
+// the step finally cleared its tests, restarting the bake timer in a loop.
 func (r *RolloutStepGateReconciler) resetStepDeadlineForRetry(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout, stepIndex int32, retryCutoff *metav1.Time) error {
 	if retryCutoff == nil {
 		return nil
@@ -930,8 +938,7 @@ func (r *RolloutStepGateReconciler) resetStepDeadlineForRetry(ctx context.Contex
 	startedAtKey := fmt.Sprintf(internalAnnotationStepStartedAtPrefix, stepIndex)
 	readyAtKey := fmt.Sprintf(internalAnnotationStepReadyAtPrefix, stepIndex)
 	desired := retryCutoff.Format(time.RFC3339)
-	_, hasReadyAt := rollout.Annotations[readyAtKey]
-	if rollout.Annotations[startedAtKey] == desired && !hasReadyAt {
+	if rollout.Annotations[startedAtKey] == desired {
 		return nil
 	}
 	rollout.Annotations[startedAtKey] = desired
