@@ -915,7 +915,10 @@ func stalledBefore(rollout *kruiserolloutv1beta1.Rollout, cutoff *metav1.Time) b
 	}
 	for _, c := range rollout.Status.Conditions {
 		if c.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") && c.Status == corev1.ConditionTrue {
-			return c.LastTransitionTime.Time.Before(cutoff.Time)
+			// Use <= (not strict <): a stall that happened in the same wall-clock
+			// second as the retry is still a pre-retry stall — the user is retrying
+			// to escape from that state.
+			return !cutoff.Time.Before(c.LastTransitionTime.Time)
 		}
 	}
 	return false
@@ -1060,7 +1063,11 @@ func isStaleFailedTest(test *rolloutv1alpha1.RolloutTest, retryCutoff *metav1.Ti
 		// as fresh so we don't silently drop a real failure.
 		return false
 	}
-	return cond.LastTransitionTime.Time.Before(retryCutoff.Time)
+	// Use <= (not strict <): a failure in the same wall-clock second as the
+	// retry cutoff is still a pre-retry failure — the user is retrying to
+	// escape from that state. Strict Before caused retries to be no-ops when
+	// failure and retry timestamps fell in the same second.
+	return !retryCutoff.Time.Before(cond.LastTransitionTime.Time)
 }
 
 // getBakeFailureStatus checks if the rollout was deployed by kustomize and if the
