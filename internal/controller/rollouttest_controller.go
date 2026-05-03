@@ -104,12 +104,14 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// Check if rollout has moved to a different step (manually approved) or is stalled
 		// If CurrentStepIndex is no longer at the RolloutTest's StepIndex, or Rollout is Stalled, cancel the job
 		isStalled, stallReason := r.isRolloutStalled(&rollout)
-		// If stalled due to TestFailed, do NOT cancel the job - let it be reported as Failed
-		shouldCancel := isStalled && stallReason != "RolloutTestFailed"
+		bakeFailed := r.isBakeFailed(&rollout)
+		// If stalled due to TestFailed, do NOT cancel the job - let it be reported as Failed.
+		// Bake failure always cancels the job — tests are pointless once the bake has failed.
+		shouldCancel := (isStalled && stallReason != "RolloutTestFailed") || bakeFailed
 		// Same stale-Stalled guard as the no-job branch: if a retry postdates the
 		// Stalled transition, the stepgate is unwinding the stall — don't delete
 		// the Job based on a condition that's about to be cleared.
-		if shouldCancel {
+		if shouldCancel && isStalled && !bakeFailed {
 			retryCutoff, _ := r.lookupKuberikRetryCutoff(ctx, &rollout)
 			if stalledBefore(&rollout, retryCutoff) {
 				log.Info("Rollout stalled but stall predates retry — leaving job intact",
@@ -122,8 +124,13 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if rollout.Status.CurrentStepIndex != rolloutTest.Spec.StepIndex || shouldCancel {
 			cancellationMessage := "Test job was cancelled because rollout step moved forward"
 			if shouldCancel {
-				log.Info("Rollout is stalled (non-test reason), cancelling job", "reason", stallReason)
-				cancellationMessage = fmt.Sprintf("Test job was cancelled because rollout is stalled (%s)", stallReason)
+				if bakeFailed {
+					log.Info("Kuberik rollout bake failed, cancelling job")
+					cancellationMessage = "Test job was cancelled because kuberik rollout bake failed"
+				} else {
+					log.Info("Rollout is stalled (non-test reason), cancelling job", "reason", stallReason)
+					cancellationMessage = fmt.Sprintf("Test job was cancelled because rollout is stalled (%s)", stallReason)
+				}
 			} else {
 				log.Info("Rollout step changed, cancelling job",
 					"currentStep", rollout.Status.CurrentStepIndex,
@@ -331,6 +338,14 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if rollout.Status.CurrentStepIndex == rolloutTest.Spec.StepIndex {
 		// Check if rollout is stalled
 		isStalled, stallReason := r.isRolloutStalled(&rollout)
+		// Block job creation when kuberik bake has failed. Unlike the Stalled
+		// condition, KuberikBakeHealthy=False does not use the retry/kstatus
+		// machinery, so there is no stale-guard or phase cancellation needed —
+		// just skip and requeue until bake is resolved or a new canary appears.
+		if !isStalled && r.isBakeFailed(&rollout) {
+			log.Info("Kuberik rollout bake failed, not creating Job", "step", rolloutTest.Spec.StepIndex)
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
 		// If stalled for any reason, don't create new jobs
 		if isStalled {
 			// Guard against acting on a stale Stalled condition: if a retry on
@@ -654,6 +669,21 @@ func (r *RolloutTestReconciler) lookupKuberikRetryCutoff(ctx context.Context, ro
 		return nil, ""
 	}
 	return cutoff, mode
+}
+
+// isBakeFailed returns true when the stepgate has set KuberikBakeHealthy=False on
+// the Kruise Rollout, meaning the kuberik Rollout's bake period has failed and
+// canary progression is blocked. Unlike the Stalled condition, KuberikBakeHealthy=False
+// does not trigger kstatus retry machinery — it is observability-only, so we check
+// it explicitly here instead of relying on isRolloutStalled.
+func (r *RolloutTestReconciler) isBakeFailed(rollout *kruiserolloutv1beta1.Rollout) bool {
+	for _, condition := range rollout.Status.Conditions {
+		if condition.Type == kruiserolloutv1beta1.RolloutConditionType("KuberikBakeHealthy") &&
+			condition.Status == corev1.ConditionFalse {
+			return true
+		}
+	}
+	return false
 }
 
 // isRolloutStalled checks if the rollout is in a stalled state

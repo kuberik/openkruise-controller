@@ -1112,6 +1112,134 @@ var _ = Describe("RolloutTest Controller", func() {
 		})
 
 		Context("When rollout is stalled", func() {
+			It("should not run the test if KuberikBakeHealthy condition is False (bake failed, no Stalled condition)", func() {
+				// Regression: the fix that stopped setting Stalled=True on bake failure
+				// (using KuberikBakeHealthy=False instead) broke the gate that prevents
+				// test creation. isRolloutStalled only checks Stalled=True, so tests
+				// were firing when the kuberik rollout bake had failed.
+				ctx := context.Background()
+				controllerReconciler := &RolloutTestReconciler{
+					Client: k8sClient,
+					Scheme: k8sClient.Scheme(),
+				}
+
+				By("Updating Rollout to step 1, paused, with KuberikBakeHealthy=False but no Stalled condition")
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+				rollout.Status.CurrentStepIndex = 1
+				if rollout.Status.CanaryStatus == nil {
+					rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+				}
+				rollout.Status.CanaryStatus.CanaryRevision = "v1"
+				rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+				rollout.Status.Conditions = []kruiserolloutv1beta1.RolloutCondition{
+					{
+						Type:               kruiserolloutv1beta1.RolloutConditionType("KuberikBakeHealthy"),
+						Status:             corev1.ConditionFalse,
+						Reason:             "BakeFailed",
+						Message:            "Kuberik Rollout has failed bake status",
+						LastTransitionTime: metav1.Now(),
+						LastUpdateTime:     metav1.Now(),
+					},
+				}
+				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+				By("Reconciling - should NOT create job because bake has failed")
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				Expect(err).NotTo(HaveOccurred())
+
+				By("Verifying no Job was created")
+				var jobs batchv1.JobList
+				err = k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": resourceName})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(jobs.Items).To(HaveLen(0), "Job must not be created when KuberikBakeHealthy=False")
+			})
+
+			It("should cancel a running job when KuberikBakeHealthy becomes False", func() {
+				ctx := context.Background()
+				controllerReconciler := &RolloutTestReconciler{
+					Client: k8sClient,
+					Scheme: k8sClient.Scheme(),
+				}
+
+				By("Updating Rollout to step 1, paused, bake healthy")
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+				rollout.Status.CurrentStepIndex = 1
+				if rollout.Status.CanaryStatus == nil {
+					rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+				}
+				rollout.Status.CanaryStatus.CanaryRevision = "v1"
+				rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+				rollout.Status.Conditions = nil
+				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+				By("Reconciling - should create job")
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				Expect(err).NotTo(HaveOccurred())
+
+				By("Verifying Job was created")
+				var jobs batchv1.JobList
+				err = k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": resourceName})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(jobs.Items).To(HaveLen(1))
+				job := &jobs.Items[0]
+
+				By("Setting job to running state")
+				job.Status.Active = 1
+				job.Status.StartTime = &metav1.Time{Time: time.Now()}
+				Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+
+				By("Reconciling to update status to Running")
+				_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				Expect(err).NotTo(HaveOccurred())
+
+				var rt rolloutv1alpha1.RolloutTest
+				Expect(k8sClient.Get(ctx, typeNamespacedName, &rt)).To(Succeed())
+				Expect(rt.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseRunning))
+
+				By("Kuberik bake fails: setting KuberikBakeHealthy=False on rollout (no Stalled condition)")
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+				rollout.Status.Conditions = []kruiserolloutv1beta1.RolloutCondition{
+					{
+						Type:               kruiserolloutv1beta1.RolloutConditionType("KuberikBakeHealthy"),
+						Status:             corev1.ConditionFalse,
+						Reason:             "BakeFailed",
+						Message:            "Kuberik Rollout has failed bake status",
+						LastTransitionTime: metav1.Now(),
+						LastUpdateTime:     metav1.Now(),
+					},
+				}
+				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+				By("Reconciling - should cancel the running job")
+				_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				Expect(err).NotTo(HaveOccurred())
+
+				By("Verifying Job was deleted")
+				for i := 0; i < 10; i++ {
+					var deletedJob batchv1.Job
+					err = k8sClient.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: namespace}, &deletedJob)
+					if errors.IsNotFound(err) {
+						break
+					}
+					if !deletedJob.DeletionTimestamp.IsZero() && len(deletedJob.Finalizers) > 0 {
+						deletedJob.Finalizers = []string{}
+						_ = k8sClient.Update(ctx, &deletedJob)
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+				var deletedJob batchv1.Job
+				err = k8sClient.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: namespace}, &deletedJob)
+				Expect(errors.IsNotFound(err)).To(BeTrue())
+
+				By("Verifying RolloutTest status is Cancelled with bake-failure message")
+				Expect(k8sClient.Get(ctx, typeNamespacedName, &rt)).To(Succeed())
+				Expect(rt.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseCancelled))
+				readyCondition := meta.FindStatusCondition(rt.Status.Conditions, "Ready")
+				Expect(readyCondition).NotTo(BeNil())
+				Expect(readyCondition.Status).To(Equal(metav1.ConditionTrue))
+				Expect(readyCondition.Message).To(ContainSubstring("bake failed"))
+			})
+
 			It("should not run the test if rollout is stalled", func() {
 				ctx := context.Background()
 				controllerReconciler := &RolloutTestReconciler{
