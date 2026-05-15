@@ -916,6 +916,34 @@ var _ = Describe("RolloutStepGate step deadline refresh on retry", func() {
 		Expect(updated.Annotations[stepReadyAtKey]).To(Equal(readyAt), "step-ready-at must be preserved once step-started-at is aligned with retryCutoff")
 	})
 
+	// Regression: when failure and retry fall in the same wall-clock second,
+	// isStaleFailedTest used strict Before and returned false, so the test was
+	// never reset and the retry was effectively a no-op. The fix changes to <=.
+	It("resets a Cancelled test when failure timestamp equals retry cutoff (same-second race)", func() {
+		sameSecond := time.Now().Add(-2 * time.Minute).Truncate(time.Second)
+
+		seedStaleDeadline(ctx, sameSecond)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, f.rolloutTest)).To(Succeed())
+		f.rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseCancelled
+		f.rolloutTest.Status.Conditions = []metav1.Condition{{
+			Type:               rolloutv1alpha1.RolloutTestConditionFailed,
+			Status:             metav1.ConditionFalse,
+			Reason:             "JobCancelled",
+			Message:            "cancelled at same second as retry",
+			LastTransitionTime: metav1.NewTime(sameSecond),
+		}}
+		Expect(k8sClient.Status().Update(ctx, f.rolloutTest)).To(Succeed())
+		f.setKuberikRetry(ctx, sameSecond, rolloutv1alpha1.RetryModeRetry)
+
+		_, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.kruiseRollout.Name, Namespace: f.ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		updatedTest := &rolloutv1alpha1.RolloutTest{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, updatedTest)).To(Succeed())
+		Expect(updatedTest.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseWaitingForStep),
+			"test cancelled at the same second as retry must be reset (same-second = pre-retry)")
+	})
+
 	It("resets a Cancelled test when Stalled=False at retry time", func() {
 		stalePast := time.Now().Add(-30 * time.Minute)
 		retryAt := time.Now().Add(-2 * time.Minute).Truncate(time.Second)
@@ -985,6 +1013,25 @@ var _ = Describe("RolloutTest stale-Stalled guard (retry cutoff)", func() {
 		updated := &rolloutv1alpha1.RolloutTest{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, updated)).To(Succeed())
 		Expect(updated.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhasePending), "phase must not flip to Cancelled on stale stall")
+	})
+
+	// Regression: when stall and retry fall in the same wall-clock second,
+	// stalledBefore used strict Before and returned false, so the guard didn't
+	// fire and the test was cancelled. The fix changes to <=.
+	It("does NOT cancel a Pending test when Stalled timestamp equals retry cutoff (same-second race)", func() {
+		sameSecond := time.Now().Add(-1 * time.Minute)
+
+		f.setStalled(ctx, "KuberikRolloutBakeFailed", sameSecond)
+		f.setKuberikRetry(ctx, sameSecond, rolloutv1alpha1.RetryModeRetry)
+		markTestPhase(ctx, rolloutv1alpha1.RolloutTestPhasePending)
+
+		result, err := f.testReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).NotTo(BeZero(), "should requeue while waiting for stepgate to clear stale stall")
+
+		updated := &rolloutv1alpha1.RolloutTest{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhasePending), "phase must not flip to Cancelled when stall and retry are the same second")
 	})
 
 	It("DOES cancel a Pending test when Stalled is fresh (postdates retry cutoff)", func() {
