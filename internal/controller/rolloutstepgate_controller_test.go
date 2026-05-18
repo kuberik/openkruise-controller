@@ -519,6 +519,200 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 		})
 
+		It("should NOT set Stalled condition when rollout is already completed (phase=Healthy)", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Setting up Rollout with phase=Healthy (completed rollout)")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Status.CanaryStatus == nil {
+				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+			}
+			rollout.Status.CanaryStatus.CurrentStepIndex = 2
+			rollout.Status.CanaryStatus.CanaryRevision = "v1"
+			rollout.Status.CanaryStatus.CurrentStepState = "Completed"
+			rollout.Status.Phase = "Healthy"
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			By("Setting up a past deadline (step-2-started-at 2 minutes ago, timeout 1 minute)")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Annotations == nil {
+				rollout.Annotations = make(map[string]string)
+			}
+			pastTime := time.Now().Add(-2 * time.Minute)
+			rollout.Annotations["internal.rollout.kuberik.io/step-2-started-at"] = pastTime.Format(time.RFC3339)
+			rollout.Annotations["internal.rollout.kuberik.io/last-step-index"] = "2"
+			rollout.Annotations["rollout.kuberik.io/step-2-ready-timeout"] = "1m"
+			Expect(k8sClient.Update(ctx, rollout)).To(Succeed())
+
+			By("Reconciling - should NOT set Stalled condition on completed rollout")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying Stalled condition is NOT set")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			for _, condition := range rollout.Status.Conditions {
+				if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
+					Expect(condition.Status).NotTo(Equal(corev1.ConditionTrue),
+						"Stalled condition must not be set on a completed rollout (phase=Healthy)")
+				}
+			}
+		})
+
+		It("should NOT set Stalled condition when step state is Completed", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Setting up Rollout with currentStepState=Completed (last step done, no Healthy phase yet)")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Status.CanaryStatus == nil {
+				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+			}
+			rollout.Status.CanaryStatus.CurrentStepIndex = 1
+			rollout.Status.CanaryStatus.CanaryRevision = "v1"
+			rollout.Status.CanaryStatus.CurrentStepState = "Completed"
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			By("Setting up a past deadline (step-1-started-at 2 minutes ago, timeout 1 minute)")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Annotations == nil {
+				rollout.Annotations = make(map[string]string)
+			}
+			pastTime := time.Now().Add(-2 * time.Minute)
+			rollout.Annotations["internal.rollout.kuberik.io/step-1-started-at"] = pastTime.Format(time.RFC3339)
+			rollout.Annotations["internal.rollout.kuberik.io/last-step-index"] = "1"
+			Expect(k8sClient.Update(ctx, rollout)).To(Succeed())
+
+			By("Reconciling - should NOT set Stalled condition when step is Completed")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying Stalled condition is NOT set")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			for _, condition := range rollout.Status.Conditions {
+				if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
+					Expect(condition.Status).NotTo(Equal(corev1.ConditionTrue),
+						"Stalled condition must not be set when step state is Completed")
+				}
+			}
+		})
+
+		It("should clear existing Stalled condition when step state is Completed", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Setting up Rollout with Stalled condition and currentStepState=Completed")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Status.CanaryStatus == nil {
+				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+			}
+			rollout.Status.CanaryStatus.CurrentStepIndex = 1
+			rollout.Status.CanaryStatus.CanaryRevision = "v1"
+			rollout.Status.CanaryStatus.CurrentStepState = "Completed"
+			rollout.Status.Phase = "Healthy"
+			rollout.Status.Conditions = []kruiserolloutv1beta1.RolloutCondition{
+				{
+					Type:               kruiserolloutv1beta1.RolloutConditionType("Stalled"),
+					Status:             corev1.ConditionTrue,
+					Reason:             "StepReadyTimeoutExceeded",
+					Message:            "Step 1 ready-timeout (1m0s) exceeded at 2024-01-01T00:00:00Z for canary v1.",
+					LastTransitionTime: metav1.Now(),
+					LastUpdateTime:     metav1.Now(),
+				},
+			}
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			By("Reconciling - should clear stale Stalled condition on completed rollout")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying Stalled condition is cleared")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			for _, condition := range rollout.Status.Conditions {
+				if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
+					Expect(condition.Status).To(Equal(corev1.ConditionFalse),
+						"Stalled condition must be cleared (False) when rollout is Healthy/Completed")
+				}
+			}
+		})
+
+		It("should clear existing Stalled condition when rollout phase transitions to Healthy after a step timeout", func() {
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Simulating the exact cluster scenario: step-2 timeout fires, then rollout completes anyway")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Status.CanaryStatus == nil {
+				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+			}
+			rollout.Status.CanaryStatus.CurrentStepIndex = 2
+			rollout.Status.CanaryStatus.CanaryRevision = "v1"
+			rollout.Status.CanaryStatus.CurrentStepState = "Completed"
+			rollout.Status.Phase = "Healthy"
+			rollout.Status.Conditions = []kruiserolloutv1beta1.RolloutCondition{
+				{
+					Type:    kruiserolloutv1beta1.RolloutConditionType("Stalled"),
+					Status:  corev1.ConditionTrue,
+					Reason:  "StepReadyTimeoutExceeded",
+					Message: "Step 2 step-ready-timeout (10m0s) exceeded at 2026-05-18T06:09:38Z for canary v1. Rollout is paused and requires manual intervention.",
+				},
+			}
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			if rollout.Annotations == nil {
+				rollout.Annotations = make(map[string]string)
+			}
+			rollout.Annotations["internal.rollout.kuberik.io/step-2-started-at"] = time.Now().Add(-15 * time.Minute).Format(time.RFC3339)
+			rollout.Annotations["internal.rollout.kuberik.io/last-step-index"] = "2"
+			rollout.Annotations["rollout.kuberik.io/step-2-ready-timeout"] = "10m"
+			Expect(k8sClient.Update(ctx, rollout)).To(Succeed())
+
+			By("Reconciling - should clear Stalled and not re-set it")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying Stalled condition is cleared (False or absent)")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			for _, condition := range rollout.Status.Conditions {
+				if condition.Type == kruiserolloutv1beta1.RolloutConditionType("Stalled") {
+					Expect(condition.Status).To(Equal(corev1.ConditionFalse),
+						"Stalled must be cleared on Healthy/Completed rollout")
+				}
+			}
+		})
+
 		It("should clear Stalled condition when new rollout version starts", func() {
 			ctx := context.Background()
 			controllerReconciler := &RolloutStepGateReconciler{
