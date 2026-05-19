@@ -100,6 +100,23 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, nil
 	}
 
+	// Rollout is done — clear any lingering Stalled condition and stop monitoring.
+	// "Completed" means the final step finished; "Healthy" means the whole rollout
+	// succeeded. Neither state should trigger the timeout machinery.
+	currentStepState := rollout.Status.CanaryStatus.CurrentStepState
+	if rollout.Status.Phase == "Healthy" || currentStepState == "Completed" {
+		if r.clearStalledCondition(&rollout) {
+			log.Info("Clearing Stalled condition on completed/healthy rollout",
+				"phase", rollout.Status.Phase,
+				"stepState", currentStepState)
+			if err := r.Status().Update(ctx, &rollout); err != nil {
+				log.Error(err, "failed to clear Stalled condition on completed rollout")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
 	currentRevision := rollout.Status.CanaryStatus.CanaryRevision
 	lastRevisionStr := r.getStepAnnotation(&rollout, currentStepIndex, internalAnnotationStepLastRevisionPrefix)
 
