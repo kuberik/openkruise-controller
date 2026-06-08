@@ -105,9 +105,13 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// If CurrentStepIndex is no longer at the RolloutTest's StepIndex, or Rollout is Stalled, cancel the job
 		isStalled, stallReason := r.isRolloutStalled(&rollout)
 		bakeFailed := r.isBakeFailed(&rollout)
-		// If stalled due to TestFailed, do NOT cancel the job - let it be reported as Failed.
-		// Bake failure always cancels the job — tests are pointless once the bake has failed.
-		shouldCancel := (isStalled && stallReason != "RolloutTestFailed") || bakeFailed
+		// If stalled because a RolloutTest failed, do NOT cancel the job — the test
+		// failure is the meaningful result and must be preserved as Failed. This holds
+		// even when the bake has also failed: a broken deployment commonly fails both
+		// the test and the bake (KuberikBakeHealthy=False), and cancelling here would
+		// mask the real test failure by reporting Cancelled instead of Failed.
+		testFailedStall := isStalled && stallReason == "RolloutTestFailed"
+		shouldCancel := !testFailedStall && (isStalled || bakeFailed)
 		// Same stale-Stalled guard as the no-job branch: if a retry postdates the
 		// Stalled transition, the stepgate is unwinding the stall — don't delete
 		// the Job based on a condition that's about to be cleared.
