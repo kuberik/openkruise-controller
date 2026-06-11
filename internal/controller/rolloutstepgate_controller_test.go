@@ -181,6 +181,67 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			Expect(result.Status).To(Equal(status.FailedStatus))
 		})
 
+		It("should NOT stall on ready-timeout while a test is actively running", func() {
+			// Regression: the step is "not ready" precisely because the test hasn't
+			// finished yet — stepIsReady requires allPassed. Stalling on the deadline
+			// in that window races the very test that gates readiness: the stall
+			// cancels the running job mid-flight, erasing the Failed verdict the test
+			// was about to produce (and the Cancelled test then can't explain the
+			// failure). The deadline must yield while a test is actively executing;
+			// the test's own Job limits bound its runtime and produce the truthful
+			// RolloutTestFailed stall when it fails.
+			ctx := context.Background()
+			controllerReconciler := &RolloutStepGateReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("Setting up Rollout at step 1, paused")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			if rollout.Status.CanaryStatus == nil {
+				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+			}
+			rollout.Status.CanaryStatus.CurrentStepIndex = 1
+			rollout.Status.CanaryStatus.CanaryRevision = "v1"
+			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+			By("Setting up RolloutTest as actively Running")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollouttest", Namespace: namespace}, rolloutTest)).To(Succeed())
+			rolloutTest.Status.ObservedCanaryRevision = "v1"
+			rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseRunning
+			rolloutTest.Status.JobName = "test-rollouttest-job"
+			Expect(k8sClient.Status().Update(ctx, rolloutTest)).To(Succeed())
+
+			By("Setting started-at annotation to a time in the past (exceeding ready-timeout)")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			pastTime := time.Now().Add(-2 * time.Minute) // 2 minutes ago, ready-timeout is 1 minute
+			if rollout.Annotations == nil {
+				rollout.Annotations = make(map[string]string)
+			}
+			rollout.Annotations["internal.rollout.kuberik.io/step-1-started-at"] = pastTime.Format(time.RFC3339)
+			rollout.Annotations["internal.rollout.kuberik.io/last-step-index"] = "1"
+			Expect(k8sClient.Update(ctx, rollout)).To(Succeed())
+
+			By("Reconciling - deadline is exceeded but a test is running")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      "test-rollout",
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying NO Stalled condition was set")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+			for _, cond := range rollout.Status.Conditions {
+				if string(cond.Type) == "Stalled" {
+					Expect(cond.Status).NotTo(Equal(corev1.ConditionTrue),
+						"ready-timeout must not stall while a test is actively running")
+				}
+			}
+		})
+
 		It("should NOT timeout if step becomes ready before deadline", func() {
 			ctx := context.Background()
 			controllerReconciler := &RolloutStepGateReconciler{
@@ -386,7 +447,8 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			rolloutTest.Status.ObservedCanaryRevision = "v1"
 			rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseCancelled
 			rolloutTest.Status.FailedPods = 2
-			// Cancelled tests have Failed condition = False but should be treated as failed
+			// Cancelled tests have Failed condition = False; they block progression
+			// (step must not become ready) but do not count as failed tests
 			rolloutTest.Status.Conditions = []metav1.Condition{
 				{
 					Type:               "Ready",
@@ -425,6 +487,19 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
 			_, exists := rollout.Annotations["internal.rollout.kuberik.io/step-1-ready-at"]
 			Expect(exists).To(BeFalse(), "readyAt should NOT be set when test is Cancelled")
+
+			By("Verifying the stall is NOT attributed to a failed test")
+			// Regression: a Cancelled test has no verdict — stalls cancel running
+			// tests, so attributing the stall to the cancelled test inverts cause and
+			// effect ("rollout failed because of failed test" while the test says
+			// Cancelled). A genuinely failing cancelled test is recorded as Failed by
+			// the rollouttest controller instead.
+			for _, cond := range rollout.Status.Conditions {
+				if string(cond.Type) == "Stalled" && cond.Status == corev1.ConditionTrue {
+					Expect(cond.Reason).NotTo(Equal("RolloutTestFailed"),
+						"Cancelled test must not produce the RolloutTestFailed stall reason")
+				}
+			}
 		})
 
 		It("should clear Stalled condition when within deadline", func() {
