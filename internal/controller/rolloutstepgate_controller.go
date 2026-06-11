@@ -347,6 +347,23 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 	anyFailed := anyFailedTests || bakeFailed
 
+	// A test that is actively executing (job created / running) must be allowed to
+	// reach its own verdict. stepIsReady requires allPassed, so while a test runs
+	// the step is by definition "not ready" — if the ready-timeout were allowed to
+	// stall in that window, it would race the very test that gates readiness and
+	// (via the rollouttest controller's stall handling) cancel it mid-run, erasing
+	// the Failed verdict the test was about to produce. The test's own runtime is
+	// bounded by its Job (backoffLimit / activeDeadlineSeconds), which terminates
+	// it as Failed and stalls the rollout with the truthful RolloutTestFailed.
+	anyTestActive := false
+	for i := range relevantTests {
+		phase := relevantTests[i].Status.Phase
+		if phase == rolloutv1alpha1.RolloutTestPhaseRunning || phase == rolloutv1alpha1.RolloutTestPhasePending {
+			anyTestActive = true
+			break
+		}
+	}
+
 	now := time.Now()
 
 	// Get when the step started
@@ -461,7 +478,7 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 			}
 		}
-	} else if !stepIsReady && !bakeFailed && now.After(deadline) {
+	} else if !stepIsReady && !bakeFailed && !anyTestActive && now.After(deadline) {
 		log.Info("Step ready-timeout exceeded, keeping paused", "step", currentStepIndex, "deadline", deadline)
 		message := fmt.Sprintf("Step %d step-ready-timeout (%v) exceeded at %v for canary %s. Rollout is paused and requires manual intervention.", currentStepIndex, readyTimeout, deadline.Format(time.RFC3339), currentRevision)
 		stalledModified, err := r.setStalledCondition(ctx, &rollout, currentStepIndex, "StepReadyTimeoutExceeded", message)
@@ -663,10 +680,12 @@ func (r *RolloutStepGateReconciler) getRolloutTestsForStep(ctx context.Context, 
 
 // evaluateTests checks the status of all tests.
 // Returns: (allPassed, anyFailed, failedTestName)
-// When retryCutoff is non-nil, a Failed/Cancelled test whose Failed condition
+// When retryCutoff is non-nil, a Failed test whose Failed condition
 // transitioned before the cutoff is treated as still in progress. This prevents
 // RolloutStepGate from re-stalling on stale pre-retry failures during the brief
 // window between the retry request and the eventual RolloutTest reset.
+// Cancelled tests are neither failed nor passed: they block progression like an
+// in-progress test but never produce the RolloutTestFailed stall reason.
 func (r *RolloutStepGateReconciler) evaluateTests(tests []rolloutv1alpha1.RolloutTest, retryCutoff *metav1.Time) (bool, bool, string) {
 	if len(tests) == 0 {
 		// No tests means we can't approve yet - wait for tests to be created
@@ -682,19 +701,31 @@ func (r *RolloutStepGateReconciler) evaluateTests(tests []rolloutv1alpha1.Rollou
 		// Only check Phase - it's the single source of truth
 		// This avoids race conditions with partial condition updates
 		switch test.Status.Phase {
-		case rolloutv1alpha1.RolloutTestPhaseFailed, rolloutv1alpha1.RolloutTestPhaseCancelled:
+		case rolloutv1alpha1.RolloutTestPhaseFailed:
 			if isStaleFailedTest(&test, retryCutoff) {
 				// Failure predates the retry; wait for the eventual reset.
 				anyInProgress = true
 				allPassed = false
 				continue
 			}
-			// Failed or Cancelled = test failed
 			anyFailed = true
 			allPassed = false
 			if failedTestName == "" {
 				failedTestName = test.Name
 			}
+		case rolloutv1alpha1.RolloutTestPhaseCancelled:
+			// A cancelled test has no verdict: it was interrupted (step advance,
+			// stall, bake failure) before finishing. It must not count as a failed
+			// test — stalls cancel running tests, so attributing the stall to the
+			// test it cancelled inverts cause and effect and reports the
+			// contradictory "Stalled: RolloutTestFailed" while the test itself says
+			// Cancelled. (Tests that were already failing when cancelled are
+			// recorded as Failed by the rollouttest controller and take the branch
+			// above.) It does not pass either: keep the step blocked under the
+			// stall's original reason until a retry resets the test or a new canary
+			// revision appears.
+			anyInProgress = true
+			allPassed = false
 		case rolloutv1alpha1.RolloutTestPhaseSucceeded, rolloutv1alpha1.RolloutTestPhaseSkipped:
 			// Test passed (Skipped counts as passing — user intentionally bypassed it).
 		default:
