@@ -36,6 +36,15 @@ linters:
           - dupl
           - lll
         path: internal/*
+      - linters:
+          - ginkgolinter
+          - goconst
+        path: _test\.go
+      - linters:
+          - gocyclo
+          - unparam
+          - unused
+        path: internal/controller
     paths:
       - third_party$
       - builtin$
