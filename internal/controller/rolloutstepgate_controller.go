@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"math"
 	"strings"
 	"time"
 
@@ -57,9 +56,6 @@ const (
 	internalAnnotationStepLastRevisionPrefix = "internal.rollout.kuberik.io/step-%d-last-revision"
 	// Store the last step index we processed (to detect step changes)
 	internalAnnotationLastStepIndex = "internal.rollout.kuberik.io/last-step-index"
-
-	// Large duration to effectively pause indefinitely (max int32, ~68 years in seconds)
-	maxPauseDuration = int32(math.MaxInt32)
 
 	// kuberikBakeHealthyConditionType is a non-standard condition set on the Kruise Rollout
 	// to surface bake-failure blocking state. Unlike the Stalled condition, this does not
@@ -104,7 +100,7 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// "Completed" means the final step finished; "Healthy" means the whole rollout
 	// succeeded. Neither state should trigger the timeout machinery.
 	currentStepState := rollout.Status.CanaryStatus.CurrentStepState
-	if rollout.Status.Phase == "Healthy" || currentStepState == "Completed" {
+	if rollout.Status.Phase == kruiserolloutv1beta1.RolloutPhaseHealthy || currentStepState == kruiserolloutv1beta1.CanaryStepStateCompleted {
 		if r.clearStalledCondition(&rollout) {
 			log.Info("Clearing Stalled condition on completed/healthy rollout",
 				"phase", rollout.Status.Phase,
@@ -317,7 +313,7 @@ func (r *RolloutStepGateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	// Check if step is actually paused (in StepPaused state)
-	isStepPaused := r.isStepPaused(&rollout, currentStepIndex)
+	isStepPaused := r.isStepPaused(&rollout)
 
 	// Get all RolloutTests for this step
 	tests, err := r.getRolloutTestsForStep(ctx, rollout.Namespace, rollout.Name, currentStepIndex)
@@ -551,14 +547,14 @@ func (r *RolloutStepGateReconciler) setStepAnnotation(ctx context.Context, rollo
 }
 
 // isStepPaused checks if the step is in a paused state
-func (r *RolloutStepGateReconciler) isStepPaused(rollout *kruiserolloutv1beta1.Rollout, stepIndex int32) bool {
+func (r *RolloutStepGateReconciler) isStepPaused(rollout *kruiserolloutv1beta1.Rollout) bool {
 	if rollout.Status.CanaryStatus == nil {
 		return false
 	}
 	// Check if currentStepState indicates paused state
 	// Common values: "StepPaused", "Paused", etc.
 	state := rollout.Status.CanaryStatus.CurrentStepState
-	return state == "StepPaused" || state == "Paused"
+	return state == kruiserolloutv1beta1.CanaryStepStatePaused || state == "Paused"
 }
 
 // cleanupStepAnnotations removes internal annotations for a step
@@ -830,13 +826,6 @@ func (r *RolloutStepGateReconciler) syncBakeHealthCondition(rollout *kruiserollo
 // the caller can clear the mode annotation after acting on a fresh retry.
 func (r *RolloutStepGateReconciler) getKuberikRetryCutoff(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) (kuberikRollout *kuberikrolloutv1alpha1.Rollout, cutoff *metav1.Time, mode string, err error) {
 	return lookupKuberikRetryContext(ctx, r.Client, rollout, r.findKuberikRolloutForKustomization)
-}
-
-// findKuberikRollout resolves the kuberik Rollout associated with the given
-// Kruise Rollout via its Kustomization. Returns (nil, nil) when the linkage is
-// missing — this is a normal, non-error outcome.
-func (r *RolloutStepGateReconciler) findKuberikRollout(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) (*kuberikrolloutv1alpha1.Rollout, error) {
-	return findKuberikRollout(ctx, r.Client, rollout, r.findKuberikRolloutForKustomization)
 }
 
 // kuberikResolverFn is the Kustomization → kuberik Rollout resolver. The

@@ -116,7 +116,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// Stalled transition, the stepgate is unwinding the stall — don't delete
 		// the Job based on a condition that's about to be cleared.
 		if shouldCancel && isStalled && !bakeFailed {
-			retryCutoff, _ := r.lookupKuberikRetryCutoff(ctx, &rollout)
+			retryCutoff := r.lookupKuberikRetryCutoff(ctx, &rollout)
 			if stalledBefore(&rollout, retryCutoff) {
 				log.Info("Rollout stalled but stall predates retry — leaving job intact",
 					"reason", stallReason,
@@ -142,13 +142,9 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			}
 			// If job finished checking, update status before deletion to preserve Succeeded/Failed state
 			if r.isJobSucceeded(job) || r.isJobFailed(job) {
-				currentRevision := ""
-				if rollout.Status.CanaryStatus != nil {
-					currentRevision = rollout.Status.CanaryStatus.CanaryRevision
-				}
 				// Update status to preserve terminal state (Succeeded/Failed)
 				// The cache is automatically updated by controller-runtime
-				_, _ = r.updateStatus(ctx, &rolloutTest, job, currentRevision)
+				_, _ = r.updateStatus(ctx, &rolloutTest, job)
 			}
 
 			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !errors.IsNotFound(err) {
@@ -259,12 +255,6 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 
 		// If Job exists and matches revision (or we can't tell), update status based on job
-		// Get the current canaryRevision (may be empty if CanaryStatus is nil)
-		currentRevision := ""
-		if rollout.Status.CanaryStatus != nil {
-			currentRevision = rollout.Status.CanaryStatus.CanaryRevision
-		}
-
 		// Job is being deleted (DeletionTimestamp set by background/foreground deletion).
 		// The stepgate already patched the test to the correct terminal phase (Skipped or
 		// WaitingForStep) before issuing the delete. Calling updateStatus here would
@@ -272,7 +262,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if job.DeletionTimestamp != nil {
 			return ctrl.Result{}, nil
 		}
-		return r.updateStatus(ctx, &rolloutTest, job, currentRevision)
+		return r.updateStatus(ctx, &rolloutTest, job)
 	}
 
 	// If Job does not exist, check if we should create one
@@ -357,7 +347,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			// stepgate is about to clear it. Acting now would cancel a test the
 			// stepgate just reset to WaitingForStep (or about to). Requeue and
 			// let stepgate's clear propagate.
-			retryCutoff, _ := r.lookupKuberikRetryCutoff(ctx, &rollout)
+			retryCutoff := r.lookupKuberikRetryCutoff(ctx, &rollout)
 			if stalledBefore(&rollout, retryCutoff) {
 				log.Info("Rollout is stalled but stall predates retry — waiting for stepgate to clear",
 					"step", rolloutTest.Spec.StepIndex, "reason", stallReason,
@@ -527,7 +517,7 @@ func (r *RolloutTestReconciler) isJobSucceeded(job *batchv1.Job) bool {
 	return false
 }
 
-func (r *RolloutTestReconciler) updateStatus(ctx context.Context, rolloutTest *rolloutv1alpha1.RolloutTest, job *batchv1.Job, canaryRevision string) (ctrl.Result, error) {
+func (r *RolloutTestReconciler) updateStatus(ctx context.Context, rolloutTest *rolloutv1alpha1.RolloutTest, job *batchv1.Job) (ctrl.Result, error) {
 	// Update job-related status fields
 	rolloutTest.Status.JobName = job.Name
 	rolloutTest.Status.ActivePods = job.Status.Active
@@ -652,11 +642,11 @@ func (r *RolloutTestReconciler) isCanaryPaused(rollout *kruiserolloutv1beta1.Rol
 	// Check if currentStepState indicates paused state
 	// Common values: "StepPaused", "Paused", etc.
 	state := rollout.Status.CanaryStatus.CurrentStepState
-	return state == "StepPaused" || state == "Paused"
+	return state == kruiserolloutv1beta1.CanaryStepStatePaused || state == "Paused"
 }
 
-// lookupKuberikRetryCutoff returns (LastRetryTimestamp, retry mode) from the
-// linked kuberik Rollout, or (nil, "") when the linkage is missing or no retry
+// lookupKuberikRetryCutoff returns LastRetryTimestamp from the
+// linked kuberik Rollout, or nil when the linkage is missing or no retry
 // has been recorded. Errors are logged at debug level and swallowed — the
 // stale-Stalled guard is a best-effort safeguard, so a lookup failure means we
 // fall through to the conservative default (treat Stalled as fresh).
@@ -664,15 +654,15 @@ func (r *RolloutTestReconciler) isCanaryPaused(rollout *kruiserolloutv1beta1.Rol
 // This is a read-only check: the kuberik Rollout pointer is intentionally
 // dropped because the test reconciler observes the retry but does not act on it
 // (and therefore must not clear the mode annotation — that is the stepgate's job).
-func (r *RolloutTestReconciler) lookupKuberikRetryCutoff(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) (*metav1.Time, string) {
-	_, cutoff, mode, err := lookupKuberikRetryContext(ctx, r.Client, rollout, func(ctx context.Context, k *kustomizev1.Kustomization) (*kuberikrolloutv1alpha1.Rollout, error) {
+func (r *RolloutTestReconciler) lookupKuberikRetryCutoff(ctx context.Context, rollout *kruiserolloutv1beta1.Rollout) *metav1.Time {
+	_, cutoff, _, err := lookupKuberikRetryContext(ctx, r.Client, rollout, func(ctx context.Context, k *kustomizev1.Kustomization) (*kuberikrolloutv1alpha1.Rollout, error) {
 		return kuberikRetryResolver(ctx, r.Client, k)
 	})
 	if err != nil {
 		logf.FromContext(ctx).V(5).Info("failed to read kuberik retry context", "error", err)
-		return nil, ""
+		return nil
 	}
-	return cutoff, mode
+	return cutoff
 }
 
 // isBakeFailed returns true when the stepgate has set KuberikBakeHealthy=False on
