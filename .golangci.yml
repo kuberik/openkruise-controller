@@ -36,6 +36,16 @@ linters:
           - dupl
           - lll
         path: internal/*
+      # Temporary: these reconcilers are long by design for now. Drop each entry
+      # once its function is split up.
+      - linters:
+          - gocyclo
+        path: internal/controller/rolloutstepgate_controller\.go
+        text: "of func `\\(\\*RolloutStepGateReconciler\\)\\.Reconcile` is high"
+      - linters:
+          - gocyclo
+        path: internal/controller/rollouttest_controller\.go
+        text: "of func `\\(\\*RolloutTestReconciler\\)\\.Reconcile` is high"
     paths:
       - third_party$
       - builtin$
