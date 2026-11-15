@@ -835,8 +835,10 @@ func (r *RolloutStepGateReconciler) getKuberikRetryCutoff(ctx context.Context, r
 // Rollout lookup via this package-level helper.
 type kuberikResolverFn func(ctx context.Context, kustomization *kustomizev1.Kustomization) (*kuberikrolloutv1alpha1.Rollout, error)
 
-// findKuberikRollout is the package-level version of the method above, accepting
-// the Client and resolver as parameters. Used from multiple reconcilers.
+// findKuberikRollout resolves the kuberik Rollout associated with the given
+// Kruise Rollout via its Kustomization, taking the Client and resolver as
+// parameters so multiple reconcilers can share it. Returns (nil, nil) when the
+// linkage is missing — this is a normal, non-error outcome.
 func findKuberikRollout(ctx context.Context, c client.Client, rollout *kruiserolloutv1beta1.Rollout, resolve kuberikResolverFn) (*kuberikrolloutv1alpha1.Rollout, error) {
 	kustomizeName := rollout.Annotations["kustomize.toolkit.fluxcd.io/name"]
 	if kustomizeName == "" {
