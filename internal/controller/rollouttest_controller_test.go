@@ -120,7 +120,7 @@ var _ = Describe("RolloutTest Controller", func() {
 				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
 			}
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 			By("Reconciling to create job")
@@ -192,7 +192,7 @@ var _ = Describe("RolloutTest Controller", func() {
 				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
 			}
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 			By("Reconciling to create job")
@@ -268,7 +268,7 @@ var _ = Describe("RolloutTest Controller", func() {
 				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
 			}
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 			By("Reconciling to create first job")
@@ -320,7 +320,7 @@ var _ = Describe("RolloutTest Controller", func() {
 			By("Triggering new rollout (v2) and ensuring paused")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
 			rollout.Status.CanaryStatus.CanaryRevision = "v2"
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 			By("Reconciling - should delete old job")
@@ -354,7 +354,7 @@ var _ = Describe("RolloutTest Controller", func() {
 
 			err = k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": resourceName})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(jobs.Items).To(HaveLen(0), "Old job should be deleted")
+			Expect(jobs.Items).To(BeEmpty(), "Old job should be deleted")
 
 			By("Reconciling - should create new job")
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
@@ -411,11 +411,11 @@ var _ = Describe("RolloutTest Controller", func() {
 			var jobs batchv1.JobList
 			err = k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": resourceName})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(jobs.Items).To(HaveLen(0), "Job should not be created when canary is not paused")
+			Expect(jobs.Items).To(BeEmpty(), "Job should not be created when canary is not paused")
 
 			By("Updating Rollout to paused state")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 			By("Reconciling - should now create job")
@@ -498,7 +498,7 @@ var _ = Describe("RolloutTest Controller", func() {
 					rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
 				}
 				rollout.Status.CanaryStatus.CanaryRevision = "v1"
-				rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+				rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 				By("Reconciling to create job")
@@ -537,7 +537,7 @@ var _ = Describe("RolloutTest Controller", func() {
 					rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
 				}
 				rollout.Status.CanaryStatus.CanaryRevision = "v1"
-				rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+				rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 				By("Reconciling to create job")
@@ -587,7 +587,7 @@ var _ = Describe("RolloutTest Controller", func() {
 					rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
 				}
 				rollout.Status.CanaryStatus.CanaryRevision = "v1"
-				rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+				rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 				By("Reconciling to create job")
@@ -652,7 +652,7 @@ var _ = Describe("RolloutTest Controller", func() {
 					rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
 				}
 				rollout.Status.CanaryStatus.CanaryRevision = "v1"
-				rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+				rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 				By("Reconciling to create job")
@@ -722,7 +722,7 @@ var _ = Describe("RolloutTest Controller", func() {
 				}
 				rollout.Status.CurrentStepIndex = 1
 				rollout.Status.CanaryStatus.CanaryRevision = "v1"
-				rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+				rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 				By("Reconciling to create the job")
@@ -816,7 +816,7 @@ var _ = Describe("RolloutTest Controller", func() {
 				}
 				rollout.Status.CurrentStepIndex = 1
 				rollout.Status.CanaryStatus.CanaryRevision = "v1"
-				rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+				rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 				By("Reconciling to create the job")
@@ -911,7 +911,7 @@ var _ = Describe("RolloutTest Controller", func() {
 				}
 				rollout.Status.CurrentStepIndex = 1
 				rollout.Status.CanaryStatus.CanaryRevision = "v1"
-				rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+				rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 				By("Reconciling to create the job")
@@ -1025,7 +1025,7 @@ var _ = Describe("RolloutTest Controller", func() {
 				}
 				rollout.Status.CurrentStepIndex = 1
 				rollout.Status.CanaryStatus.CanaryRevision = "v1"
-				rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+				rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 				By("Reconciling to create the job")
@@ -1130,7 +1130,7 @@ var _ = Describe("RolloutTest Controller", func() {
 					rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
 				}
 				rollout.Status.CanaryStatus.CanaryRevision = "v1"
-				rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+				rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 				rollout.Status.Conditions = []kruiserolloutv1beta1.RolloutCondition{
 					{
 						Type:               kruiserolloutv1beta1.RolloutConditionType("KuberikBakeHealthy"),
@@ -1151,7 +1151,7 @@ var _ = Describe("RolloutTest Controller", func() {
 				var jobs batchv1.JobList
 				err = k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": resourceName})
 				Expect(err).NotTo(HaveOccurred())
-				Expect(jobs.Items).To(HaveLen(0), "Job must not be created when KuberikBakeHealthy=False")
+				Expect(jobs.Items).To(BeEmpty(), "Job must not be created when KuberikBakeHealthy=False")
 			})
 
 			It("should cancel a running job when KuberikBakeHealthy becomes False", func() {
@@ -1168,7 +1168,7 @@ var _ = Describe("RolloutTest Controller", func() {
 					rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
 				}
 				rollout.Status.CanaryStatus.CanaryRevision = "v1"
-				rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+				rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 				rollout.Status.Conditions = nil
 				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
@@ -1259,7 +1259,7 @@ var _ = Describe("RolloutTest Controller", func() {
 					rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
 				}
 				rollout.Status.CanaryStatus.CanaryRevision = "v1"
-				rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+				rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 				rollout.Status.Conditions = nil
 				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
@@ -1358,7 +1358,7 @@ var _ = Describe("RolloutTest Controller", func() {
 					rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
 				}
 				rollout.Status.CanaryStatus.CanaryRevision = "v1"
-				rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+				rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 				rollout.Status.Conditions = append(rollout.Status.Conditions, kruiserolloutv1beta1.RolloutCondition{
 					Type:   kruiserolloutv1beta1.RolloutConditionType("Stalled"),
 					Status: corev1.ConditionTrue,
@@ -1374,7 +1374,7 @@ var _ = Describe("RolloutTest Controller", func() {
 				var jobs batchv1.JobList
 				err = k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": resourceName})
 				Expect(err).NotTo(HaveOccurred())
-				Expect(jobs.Items).To(HaveLen(0))
+				Expect(jobs.Items).To(BeEmpty())
 
 				By("Verifying RolloutTest status is Cancelled")
 				var rt rolloutv1alpha1.RolloutTest
@@ -1420,7 +1420,7 @@ var _ = Describe("RolloutTest Controller", func() {
 					rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
 				}
 				rollout.Status.CanaryStatus.CanaryRevision = "v1"
-				rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+				rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 				// Ensure no stalled condition
 				rollout.Status.Conditions = nil
 				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
@@ -1504,7 +1504,7 @@ var _ = Describe("RolloutTest Controller", func() {
 				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
 			}
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 			By("Reconciling - should create job")
@@ -1589,7 +1589,7 @@ var _ = Describe("RolloutTest Controller", func() {
 				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
 			}
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			rollout.Status.Conditions = nil // Ensure no stalled condition initially
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 

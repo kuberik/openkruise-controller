@@ -31,6 +31,11 @@ import (
 	kruiserolloutv1beta1 "github.com/openkruise/kruise-rollout-api/rollouts/v1beta1"
 )
 
+const (
+	testStepPaused = "StepPaused"
+	testRev1       = "rev-1"
+)
+
 // setupRetryScenario builds the full linkage needed for retry detection:
 // Kruise Rollout → Kustomization → kuberik Rollout. The returned helpers let
 // each test tweak the individual pieces (stalled timestamps, retry cutoff,
@@ -100,13 +105,13 @@ func newRetryFixture(ctx context.Context) *retryFixture {
 		},
 	}
 	Expect(k8sClient.Create(ctx, kruiseRollout)).To(Succeed())
-	kruiseRollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{CanaryRevision: "rev-1"}
+	kruiseRollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{CanaryRevision: testRev1}
 	kruiseRollout.Status.CanaryStatus.CurrentStepIndex = 1
-	kruiseRollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+	kruiseRollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 	// rollouttest controller checks the top-level Status.CurrentStepIndex
 	// (separate from CanaryStatus.CurrentStepIndex); set both for parity.
 	kruiseRollout.Status.CurrentStepIndex = 1
-	kruiseRollout.Status.CurrentStepState = "StepPaused"
+	kruiseRollout.Status.CurrentStepState = testStepPaused
 	Expect(k8sClient.Status().Update(ctx, kruiseRollout)).To(Succeed())
 
 	rolloutTest := &rolloutv1alpha1.RolloutTest{
@@ -190,7 +195,7 @@ func (f *retryFixture) setTestFailed(ctx context.Context, failedAt time.Time, wi
 	GinkgoHelper()
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, f.rolloutTest)).To(Succeed())
 	f.rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseFailed
-	f.rolloutTest.Status.ObservedCanaryRevision = "rev-1"
+	f.rolloutTest.Status.ObservedCanaryRevision = testRev1
 	f.rolloutTest.Status.JobName = "app-test-job"
 	f.rolloutTest.Status.Conditions = []metav1.Condition{
 		{
@@ -557,9 +562,9 @@ var _ = Describe("RolloutTest preserves WaitingForStep under stall", func() {
 			},
 		}
 		Expect(k8sClient.Create(ctx, kruiseRollout)).To(Succeed())
-		kruiseRollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{CanaryRevision: "rev-1"}
+		kruiseRollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{CanaryRevision: testRev1}
 		kruiseRollout.Status.CanaryStatus.CurrentStepIndex = 1
-		kruiseRollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+		kruiseRollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 		kruiseRollout.Status.CurrentStepIndex = 1
 		kruiseRollout.Status.Conditions = []kruiserolloutv1beta1.RolloutCondition{{
 			Type:               kruiserolloutv1beta1.RolloutConditionType("Stalled"),
@@ -662,10 +667,10 @@ var _ = Describe("RolloutTest terminal-phase job-creation guard", func() {
 		}
 		Expect(k8sClient.Create(ctx, kruiseRollout)).To(Succeed())
 		kruiseRollout.Status.CurrentStepIndex = 1
-		kruiseRollout.Status.CurrentStepState = "StepPaused"
-		kruiseRollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{CanaryRevision: "rev-1"}
+		kruiseRollout.Status.CurrentStepState = testStepPaused
+		kruiseRollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{CanaryRevision: testRev1}
 		kruiseRollout.Status.CanaryStatus.CurrentStepIndex = 1
-		kruiseRollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+		kruiseRollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 		// Deliberately no Stalled condition — the guard under test is the
 		// terminal-phase one, not the stalled-reasons one.
 		Expect(k8sClient.Status().Update(ctx, kruiseRollout)).To(Succeed())
@@ -698,7 +703,7 @@ var _ = Describe("RolloutTest terminal-phase job-creation guard", func() {
 		GinkgoHelper()
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rolloutTest.Name, Namespace: namespace}, rolloutTest)).To(Succeed())
 		rolloutTest.Status.Phase = phase
-		rolloutTest.Status.ObservedCanaryRevision = "rev-1"
+		rolloutTest.Status.ObservedCanaryRevision = testRev1
 		Expect(k8sClient.Status().Update(ctx, rolloutTest)).To(Succeed())
 
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: rolloutTest.Name, Namespace: namespace}})
@@ -903,7 +908,7 @@ var _ = Describe("RolloutStepGate step deadline refresh on retry", func() {
 		// cleanup branch doesn't fire (which would legitimately clear step-ready-at).
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, f.rolloutTest)).To(Succeed())
 		f.rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseSucceeded
-		f.rolloutTest.Status.ObservedCanaryRevision = "rev-1"
+		f.rolloutTest.Status.ObservedCanaryRevision = testRev1
 		Expect(k8sClient.Status().Update(ctx, f.rolloutTest)).To(Succeed())
 		f.setKuberikRetry(ctx, retryAt, rolloutv1alpha1.RetryModeRetry)
 
@@ -991,7 +996,7 @@ var _ = Describe("RolloutTest stale-Stalled guard (retry cutoff)", func() {
 		GinkgoHelper()
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, f.rolloutTest)).To(Succeed())
 		f.rolloutTest.Status.Phase = phase
-		f.rolloutTest.Status.ObservedCanaryRevision = "rev-1"
+		f.rolloutTest.Status.ObservedCanaryRevision = testRev1
 		Expect(k8sClient.Status().Update(ctx, f.rolloutTest)).To(Succeed())
 	}
 
@@ -1081,7 +1086,7 @@ var _ = Describe("RolloutTest stale-Stalled guard (retry cutoff)", func() {
 				Namespace: f.ns,
 				Labels: map[string]string{
 					"rollout-test":                       f.rolloutTest.Name,
-					"rollout.kuberik.io/canary-revision": "rev-1",
+					"rollout.kuberik.io/canary-revision": testRev1,
 				},
 			},
 			Spec: f.rolloutTest.Spec.JobTemplate,
@@ -1090,7 +1095,7 @@ var _ = Describe("RolloutTest stale-Stalled guard (retry cutoff)", func() {
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, f.rolloutTest)).To(Succeed())
 		f.rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseRunning
-		f.rolloutTest.Status.ObservedCanaryRevision = "rev-1"
+		f.rolloutTest.Status.ObservedCanaryRevision = testRev1
 		f.rolloutTest.Status.JobName = job.Name
 		Expect(k8sClient.Status().Update(ctx, f.rolloutTest)).To(Succeed())
 
@@ -1124,7 +1129,7 @@ var _ = Describe("RolloutTest stale-Stalled guard (retry cutoff)", func() {
 				Namespace: f.ns,
 				Labels: map[string]string{
 					"rollout-test":                       f.rolloutTest.Name,
-					"rollout.kuberik.io/canary-revision": "rev-1",
+					"rollout.kuberik.io/canary-revision": testRev1,
 				},
 			},
 			Spec: f.rolloutTest.Spec.JobTemplate,
@@ -1133,7 +1138,7 @@ var _ = Describe("RolloutTest stale-Stalled guard (retry cutoff)", func() {
 
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: f.rolloutTest.Name, Namespace: f.ns}, f.rolloutTest)).To(Succeed())
 		f.rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseRunning
-		f.rolloutTest.Status.ObservedCanaryRevision = "rev-1"
+		f.rolloutTest.Status.ObservedCanaryRevision = testRev1
 		f.rolloutTest.Status.JobName = job.Name
 		Expect(k8sClient.Status().Update(ctx, f.rolloutTest)).To(Succeed())
 

@@ -127,7 +127,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 			rollout.Status.CanaryStatus.CurrentStepIndex = 1
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 			By("Setting up RolloutTest as NOT passed (still running)")
@@ -195,7 +195,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 			rollout.Status.CanaryStatus.CurrentStepIndex = 1
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 			By("Setting up RolloutTest as passed")
@@ -268,7 +268,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 			rollout.Status.CanaryStatus.CurrentStepIndex = 1
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 			By("Setting up RolloutTest with job still running (Ready condition is False)")
@@ -327,7 +327,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 			rollout.Status.CanaryStatus.CurrentStepIndex = 1
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 			By("Setting up RolloutTest with no conditions (not yet processed by RolloutTest controller)")
@@ -377,7 +377,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 			rollout.Status.CanaryStatus.CurrentStepIndex = 1
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 			By("Setting up RolloutTest in Cancelled state")
@@ -441,7 +441,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 			rollout.Status.CanaryStatus.CurrentStepIndex = 1
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			// Set Stalled condition first
 			rollout.Status.Conditions = []kruiserolloutv1beta1.RolloutCondition{
 				{
@@ -533,8 +533,8 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 			rollout.Status.CanaryStatus.CurrentStepIndex = 2
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "Completed"
-			rollout.Status.Phase = "Healthy"
+			rollout.Status.CanaryStatus.CurrentStepState = kruiserolloutv1beta1.CanaryStepStateCompleted
+			rollout.Status.Phase = kruiserolloutv1beta1.RolloutPhaseHealthy
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 			By("Setting up a past deadline (step-2-started-at 2 minutes ago, timeout 1 minute)")
@@ -581,7 +581,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 			rollout.Status.CanaryStatus.CurrentStepIndex = 1
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "Completed"
+			rollout.Status.CanaryStatus.CurrentStepState = kruiserolloutv1beta1.CanaryStepStateCompleted
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 			By("Setting up a past deadline (step-1-started-at 2 minutes ago, timeout 1 minute)")
@@ -627,8 +627,8 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 			rollout.Status.CanaryStatus.CurrentStepIndex = 1
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "Completed"
-			rollout.Status.Phase = "Healthy"
+			rollout.Status.CanaryStatus.CurrentStepState = kruiserolloutv1beta1.CanaryStepStateCompleted
+			rollout.Status.Phase = kruiserolloutv1beta1.RolloutPhaseHealthy
 			rollout.Status.Conditions = []kruiserolloutv1beta1.RolloutCondition{
 				{
 					Type:               kruiserolloutv1beta1.RolloutConditionType("Stalled"),
@@ -674,8 +674,8 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 			rollout.Status.CanaryStatus.CurrentStepIndex = 2
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "Completed"
-			rollout.Status.Phase = "Healthy"
+			rollout.Status.CanaryStatus.CurrentStepState = kruiserolloutv1beta1.CanaryStepStateCompleted
+			rollout.Status.Phase = kruiserolloutv1beta1.RolloutPhaseHealthy
 			rollout.Status.Conditions = []kruiserolloutv1beta1.RolloutCondition{
 				{
 					Type:    kruiserolloutv1beta1.RolloutConditionType("Stalled"),
@@ -727,7 +727,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 			rollout.Status.CanaryStatus.CurrentStepIndex = 1
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			// Set Stalled condition from previous timeout (with canary revision embedded)
 			rollout.Status.Conditions = []kruiserolloutv1beta1.RolloutCondition{
 				{
@@ -758,7 +758,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
 			}
 			rollout.Status.CanaryStatus.CurrentStepIndex = 1
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			rollout.Status.CanaryStatus.CanaryRevision = "v2"
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
@@ -810,7 +810,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 			rollout.Status.CanaryStatus.CurrentStepIndex = 1
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			// Set Stalled condition from previous test failure for canary v1
 			rollout.Status.Conditions = []kruiserolloutv1beta1.RolloutCondition{
 				{
@@ -895,7 +895,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 			rollout.Status.CanaryStatus.CurrentStepIndex = 1
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			// Set Stalled condition with canary v1 embedded in message
 			rollout.Status.Conditions = []kruiserolloutv1beta1.RolloutCondition{
 				{
@@ -957,7 +957,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 			rollout.Status.CanaryStatus.CurrentStepIndex = 1
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 			By("Setting up annotations for step 1")
@@ -1030,7 +1030,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 				rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
 			}
 			rollout.Status.CanaryStatus.CurrentStepIndex = 2
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 
 			By("Refetching rollout to ensure status update is visible")
@@ -1119,7 +1119,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			}
 			rollout.Status.CanaryStatus.CurrentStepIndex = 1
 			rollout.Status.CanaryStatus.CanaryRevision = "v1"
-			rollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
 		})
 
@@ -1301,7 +1301,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 				CanaryRevision: "v1",
 			}
 			kruiseRollout.Status.CanaryStatus.CurrentStepIndex = 1
-			kruiseRollout.Status.CanaryStatus.CurrentStepState = "StepPaused"
+			kruiseRollout.Status.CanaryStatus.CurrentStepState = testStepPaused
 			Expect(k8sClient.Status().Update(ctx, kruiseRollout)).To(Succeed())
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kruise-rollout", Namespace: namespace}, kruiseRollout)).To(Succeed())
 
@@ -1458,7 +1458,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			By("Verifying kuberik Rollout exists")
 			var testRollout kuberikrolloutv1alpha1.Rollout
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-kuberik-rollout", Namespace: namespace}, &testRollout)).To(Succeed())
-			Expect(len(testRollout.Status.History)).To(BeNumerically(">", 0))
+			Expect(testRollout.Status.History).ToNot(BeEmpty())
 			Expect(testRollout.Status.History[0].BakeStatus).NotTo(BeNil())
 			Expect(*testRollout.Status.History[0].BakeStatus).To(Equal(kuberikrolloutv1alpha1.BakeStatusFailed))
 
@@ -1473,7 +1473,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			Expect(err).NotTo(HaveOccurred(), "findKuberikRolloutForKustomization should not return error")
 			Expect(foundRollout).NotTo(BeNil(), "findKuberikRolloutForKustomization should find the Rollout")
 			Expect(foundRollout.Name).To(Equal("test-kuberik-rollout"))
-			Expect(len(foundRollout.Status.History)).To(BeNumerically(">", 0))
+			Expect(foundRollout.Status.History).ToNot(BeEmpty())
 
 			By("Reconciling - should detect failed bake status and block canary")
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -1677,7 +1677,7 @@ var _ = Describe("RolloutStepGate Controller", func() {
 			rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{
 				CommonStatus: kruiserolloutv1beta1.CommonStatus{
 					CurrentStepIndex: 1,
-					CurrentStepState: "StepPaused",
+					CurrentStepState: testStepPaused,
 				},
 				CanaryRevision: "v1",
 			}
