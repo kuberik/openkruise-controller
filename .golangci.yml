@@ -36,6 +36,10 @@ linters:
           - dupl
           - lll
         path: internal/*
+      # Tests repeat literal reasons and names on purpose; keep them readable.
+      - linters:
+          - goconst
+        path: _test\.go
       # Temporary: these reconcilers are long by design for now. Drop each entry
       # once its function is split up.
       - linters:
