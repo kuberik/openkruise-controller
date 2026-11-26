@@ -990,7 +990,7 @@ func (r *RolloutStepGateReconciler) resetFailedTestsForStep(ctx context.Context,
 		// to be created; in skip mode the old Job's status would otherwise be
 		// re-synced onto the RolloutTest by updateStatus, clobbering Skipped.
 		var jobs batchv1.JobList
-		if err := r.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": test.Name}); err != nil {
+		if err := r.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{rolloutTestJobLabel: test.Name}); err != nil {
 			return err
 		}
 		for j := range jobs.Items {
@@ -1008,7 +1008,7 @@ func (r *RolloutStepGateReconciler) resetFailedTestsForStep(ctx context.Context,
 				Type:               rolloutv1alpha1.RolloutTestConditionReady,
 				Status:             metav1.ConditionTrue,
 				ObservedGeneration: test.Generation,
-				Reason:             "TestSkipped",
+				Reason:             reasonTestSkipped,
 				Message:            msg,
 				LastTransitionTime: now,
 			})
@@ -1016,7 +1016,7 @@ func (r *RolloutStepGateReconciler) resetFailedTestsForStep(ctx context.Context,
 				Type:               rolloutv1alpha1.RolloutTestConditionFailed,
 				Status:             metav1.ConditionFalse,
 				ObservedGeneration: test.Generation,
-				Reason:             "TestSkipped",
+				Reason:             reasonTestSkipped,
 				Message:            msg,
 				LastTransitionTime: now,
 			})
@@ -1024,7 +1024,7 @@ func (r *RolloutStepGateReconciler) resetFailedTestsForStep(ctx context.Context,
 				Type:               rolloutv1alpha1.RolloutTestConditionStalled,
 				Status:             metav1.ConditionFalse,
 				ObservedGeneration: test.Generation,
-				Reason:             "TestSkipped",
+				Reason:             reasonTestSkipped,
 				Message:            msg,
 				LastTransitionTime: now,
 			})

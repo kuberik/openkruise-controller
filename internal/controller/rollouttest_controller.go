@@ -40,6 +40,16 @@ import (
 	kruiserolloutv1beta1 "github.com/openkruise/kruise-rollout-api/rollouts/v1beta1"
 )
 
+// rolloutTestJobLabel labels the Jobs a RolloutTest owns with the test's name.
+const rolloutTestJobLabel = "rollout-test"
+
+// Condition reasons shared by the RolloutTest and RolloutStepGate reconcilers.
+const (
+	reasonTestSkipped  = "TestSkipped"
+	reasonJobCancelled = "JobCancelled"
+	reasonStepAdvanced = "StepAdvanced"
+)
+
 // kuberikRetryResolver resolves the Kustomization → kuberik Rollout linkage for
 // the RolloutTest reconciler. Extracted as a variable so tests can inject a
 // fake.
@@ -69,7 +79,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	// List Jobs owned by this RolloutTest
 	var jobs batchv1.JobList
-	if err := r.List(ctx, &jobs, client.InNamespace(req.Namespace), client.MatchingLabels{"rollout-test": req.Name}); err != nil {
+	if err := r.List(ctx, &jobs, client.InNamespace(req.Namespace), client.MatchingLabels{rolloutTestJobLabel: req.Name}); err != nil {
 		log.Error(err, "unable to list child Jobs")
 		return ctrl.Result{}, err
 	}
@@ -169,7 +179,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					Type:               rolloutv1alpha1.RolloutTestConditionReady,
 					Status:             metav1.ConditionTrue,
 					ObservedGeneration: rolloutTest.Generation,
-					Reason:             "JobCancelled",
+					Reason:             reasonJobCancelled,
 					Message:            cancellationMessage,
 					LastTransitionTime: metav1.Now(),
 				})
@@ -177,7 +187,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					Type:               rolloutv1alpha1.RolloutTestConditionFailed,
 					Status:             metav1.ConditionFalse,
 					ObservedGeneration: rolloutTest.Generation,
-					Reason:             "JobCancelled",
+					Reason:             reasonJobCancelled,
 					Message:            cancellationMessage,
 					LastTransitionTime: metav1.Now(),
 				})
@@ -185,7 +195,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					Type:               rolloutv1alpha1.RolloutTestConditionStalled,
 					Status:             metav1.ConditionFalse,
 					ObservedGeneration: rolloutTest.Generation,
-					Reason:             "JobCancelled",
+					Reason:             reasonJobCancelled,
 					Message:            cancellationMessage,
 					LastTransitionTime: metav1.Now(),
 				})
@@ -203,7 +213,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 						Type:               rolloutv1alpha1.RolloutTestConditionReady,
 						Status:             metav1.ConditionTrue,
 						ObservedGeneration: rolloutTest.Generation,
-						Reason:             "StepAdvanced",
+						Reason:             reasonStepAdvanced,
 						Message:            "Step moved forward, test result is final",
 						LastTransitionTime: metav1.Now(),
 					})
@@ -211,7 +221,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 						Type:               rolloutv1alpha1.RolloutTestConditionStalled,
 						Status:             metav1.ConditionFalse,
 						ObservedGeneration: rolloutTest.Generation,
-						Reason:             "StepAdvanced",
+						Reason:             reasonStepAdvanced,
 						Message:            "Step moved forward, test is no longer blocking progress",
 						LastTransitionTime: metav1.Now(),
 					})
@@ -281,7 +291,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				Type:               rolloutv1alpha1.RolloutTestConditionReady,
 				Status:             metav1.ConditionTrue,
 				ObservedGeneration: rolloutTest.Generation,
-				Reason:             "StepAdvanced",
+				Reason:             reasonStepAdvanced,
 				Message:            "Step moved forward, test result is final",
 				LastTransitionTime: metav1.Now(),
 			})
@@ -289,7 +299,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				Type:               rolloutv1alpha1.RolloutTestConditionStalled,
 				Status:             metav1.ConditionFalse,
 				ObservedGeneration: rolloutTest.Generation,
-				Reason:             "StepAdvanced",
+				Reason:             reasonStepAdvanced,
 				Message:            "Step moved forward, test is no longer blocking progress",
 				LastTransitionTime: metav1.Now(),
 			})
@@ -379,7 +389,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					Type:               rolloutv1alpha1.RolloutTestConditionReady,
 					Status:             metav1.ConditionTrue,
 					ObservedGeneration: rolloutTest.Generation,
-					Reason:             "JobCancelled",
+					Reason:             reasonJobCancelled,
 					Message:            message,
 					LastTransitionTime: metav1.Now(),
 				})
@@ -387,7 +397,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					Type:               rolloutv1alpha1.RolloutTestConditionFailed,
 					Status:             metav1.ConditionFalse,
 					ObservedGeneration: rolloutTest.Generation,
-					Reason:             "JobCancelled",
+					Reason:             reasonJobCancelled,
 					Message:            message,
 					LastTransitionTime: metav1.Now(),
 				})
@@ -395,7 +405,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					Type:               rolloutv1alpha1.RolloutTestConditionStalled,
 					Status:             metav1.ConditionFalse,
 					ObservedGeneration: rolloutTest.Generation,
-					Reason:             "JobCancelled",
+					Reason:             reasonJobCancelled,
 					Message:            message,
 					LastTransitionTime: metav1.Now(),
 				})
@@ -466,7 +476,7 @@ func clearStaleConditions(rt *rolloutv1alpha1.RolloutTest) {
 
 func (r *RolloutTestReconciler) createJob(ctx context.Context, rolloutTest *rolloutv1alpha1.RolloutTest, canaryRevision string) (ctrl.Result, error) {
 	labels := map[string]string{
-		"rollout-test": rolloutTest.Name,
+		rolloutTestJobLabel: rolloutTest.Name,
 	}
 	if canaryRevision != "" {
 		labels["rollout.kuberik.io/canary-revision"] = canaryRevision

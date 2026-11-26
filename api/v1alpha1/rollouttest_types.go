@@ -161,5 +161,5 @@ type RolloutTestList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&RolloutTest{}, &RolloutTestList{})
+	register(&RolloutTest{}, &RolloutTestList{})
 }
