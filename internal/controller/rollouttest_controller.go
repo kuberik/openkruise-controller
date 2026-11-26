@@ -246,6 +246,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			rolloutTest.Status.SucceededPods = 0
 			rolloutTest.Status.FailedPods = 0
 			rolloutTest.Status.ObservedCanaryRevision = ""
+			clearStaleConditions(&rolloutTest)
 			if err := r.Status().Update(ctx, &rolloutTest); err != nil {
 				log.Error(err, "failed to update status after canary change")
 				return ctrl.Result{}, err
@@ -432,6 +433,7 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			rolloutTest.Status.ActivePods = 0
 			rolloutTest.Status.SucceededPods = 0
 			rolloutTest.Status.FailedPods = 0
+			clearStaleConditions(&rolloutTest)
 			if err := r.Status().Update(ctx, &rolloutTest); err != nil {
 				log.Error(err, "failed to update status")
 			}
@@ -446,11 +448,20 @@ func (r *RolloutTestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if rollout.Status.CurrentStepIndex < rolloutTest.Spec.StepIndex {
 		rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseWaitingForStep
 		rolloutTest.Status.JobName = ""
+		clearStaleConditions(&rolloutTest)
 		if err := r.Status().Update(ctx, &rolloutTest); err != nil {
 			log.Error(err, "failed to update status")
 		}
 	}
 	return ctrl.Result{}, nil
+}
+
+// clearStaleConditions drops the Ready/Failed/Stalled conditions left over from a
+// previous run. A test that is moved back to WaitingForStep has no job and no result,
+// so it must not keep reporting Failed=True or Stalled=True (the kuberik health check
+// reads them and would stay Unhealthy until the test is deleted by hand).
+func clearStaleConditions(rt *rolloutv1alpha1.RolloutTest) {
+	rt.Status.Conditions = []metav1.Condition{}
 }
 
 func (r *RolloutTestReconciler) createJob(ctx context.Context, rolloutTest *rolloutv1alpha1.RolloutTest, canaryRevision string) (ctrl.Result, error) {

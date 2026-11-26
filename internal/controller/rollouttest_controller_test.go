@@ -1011,6 +1011,89 @@ var _ = Describe("RolloutTest Controller", func() {
 		})
 
 		Context("When new canary is observed", func() {
+			It("should clear stale Failed/Stalled conditions when canaryRevision changes under a Failed test", func() {
+				ctx := context.Background()
+				r := &RolloutTestReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+				if rollout.Status.CanaryStatus == nil {
+					rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+				}
+				rollout.Status.CurrentStepIndex = 1
+				rollout.Status.CanaryStatus.CanaryRevision = "v1"
+				rollout.Status.CanaryStatus.CurrentStepState = testStepPaused
+				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+				_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				Expect(err).NotTo(HaveOccurred())
+
+				var jobs batchv1.JobList
+				Expect(k8sClient.List(ctx, &jobs, client.InNamespace(namespace), client.MatchingLabels{"rollout-test": resourceName})).To(Succeed())
+				Expect(jobs.Items).To(HaveLen(1))
+				job := jobs.Items[0]
+
+				By("failing the job")
+				now := metav1.Now()
+				job.Status.Failed = 2
+				job.Status.StartTime = &now
+				job.Status.Conditions = []batchv1.JobCondition{
+					{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue, LastTransitionTime: now, Reason: "BackoffLimitExceeded"},
+					{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, LastTransitionTime: now, Reason: "BackoffLimitExceeded"},
+				}
+				Expect(k8sClient.Status().Update(ctx, &job)).To(Succeed())
+				_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				Expect(err).NotTo(HaveOccurred())
+
+				var rt rolloutv1alpha1.RolloutTest
+				Expect(k8sClient.Get(ctx, typeNamespacedName, &rt)).To(Succeed())
+				Expect(rt.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseFailed))
+				Expect(meta.IsStatusConditionTrue(rt.Status.Conditions, rolloutv1alpha1.RolloutTestConditionFailed)).To(BeTrue())
+
+				By("Kruise cancelling the canary and moving to another revision, not paused")
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+				rollout.Status.CanaryStatus.CanaryRevision = "v2"
+				rollout.Status.CanaryStatus.CurrentStepState = "StepUpgrade"
+				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+				_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				Expect(err).NotTo(HaveOccurred())
+
+				Expect(k8sClient.Get(ctx, typeNamespacedName, &rt)).To(Succeed())
+				Expect(rt.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseWaitingForStep))
+				Expect(meta.IsStatusConditionTrue(rt.Status.Conditions, rolloutv1alpha1.RolloutTestConditionFailed)).To(BeFalse())
+				Expect(meta.IsStatusConditionTrue(rt.Status.Conditions, rolloutv1alpha1.RolloutTestConditionStalled)).To(BeFalse())
+				Expect(meta.IsStatusConditionFalse(rt.Status.Conditions, rolloutv1alpha1.RolloutTestConditionReady)).To(BeFalse())
+			})
+
+			It("should clear stale conditions on a WaitingForStep test while the rollout is at the step but not paused", func() {
+				ctx := context.Background()
+				r := &RolloutTestReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-rollout", Namespace: namespace}, rollout)).To(Succeed())
+				if rollout.Status.CanaryStatus == nil {
+					rollout.Status.CanaryStatus = &kruiserolloutv1beta1.CanaryStatus{}
+				}
+				rollout.Status.CurrentStepIndex = 1
+				rollout.Status.CanaryStatus.CanaryRevision = "v2"
+				rollout.Status.CanaryStatus.CurrentStepState = "StepUpgrade"
+				Expect(k8sClient.Status().Update(ctx, rollout)).To(Succeed())
+
+				Expect(k8sClient.Get(ctx, typeNamespacedName, rolloutTest)).To(Succeed())
+				rolloutTest.Status.Phase = rolloutv1alpha1.RolloutTestPhaseWaitingForStep
+				rolloutTest.Status.Conditions = []metav1.Condition{
+					{Type: rolloutv1alpha1.RolloutTestConditionReady, Status: metav1.ConditionFalse, Reason: "BackoffLimitExceeded", LastTransitionTime: metav1.Now()},
+					{Type: rolloutv1alpha1.RolloutTestConditionFailed, Status: metav1.ConditionTrue, Reason: "BackoffLimitExceeded", LastTransitionTime: metav1.Now()},
+					{Type: rolloutv1alpha1.RolloutTestConditionStalled, Status: metav1.ConditionTrue, Reason: "BackoffLimitExceeded", LastTransitionTime: metav1.Now()},
+				}
+				Expect(k8sClient.Status().Update(ctx, rolloutTest)).To(Succeed())
+
+				_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				Expect(err).NotTo(HaveOccurred())
+
+				var rt rolloutv1alpha1.RolloutTest
+				Expect(k8sClient.Get(ctx, typeNamespacedName, &rt)).To(Succeed())
+				Expect(rt.Status.Phase).To(Equal(rolloutv1alpha1.RolloutTestPhaseWaitingForStep))
+				Expect(rt.Status.Conditions).To(BeEmpty())
+			})
+
 			It("should reset RetryCount and FailedPods when canaryRevision changes", func() {
 				ctx := context.Background()
 				controllerReconciler := &RolloutTestReconciler{
